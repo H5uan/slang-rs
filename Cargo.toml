@@ -1,0 +1,39 @@
+[package]
+name = "slang-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Slang Rust Bindings Contributors"]
+license = "MIT OR Apache-2.0"
+description = "Rust bindings for the Slang shading language compiler"
+repository = "https://github.com/yourusername/slang-rs"
+keywords = ["slang", "shader", "compiler", "graphics", "gpu"]
+categories = ["graphics", "compilers", "external-ffi-bindings"]
+rust-version = "1.70"
+build = "build.rs"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+bindgen = "0.69"
+cc = "1.0"
+
+[lib]
+name = "slang_rs"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[features]
+default = ["static-link"]
+static-link = []
+dynamic-link = []
+
+[workspace]
+members = ["."]
+
+[profile.release]
+opt-level = 3
+lto = true
+
+[profile.dev]
+opt-level = 0
+debug = true

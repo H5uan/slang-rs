@@ -1,0 +1,43 @@
+# Rust
+/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# C++
+/build/
+/cmake-build-*/
+/out/
+*.o
+*.obj
+*.so
+*.dll
+*.lib
+*.a
+*.exe
+*.exp
+*.ilk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.vs/
+*.user
+*.suo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Slang specific
+/slang/bin/
+/slang/build/
+*.slang-module
+
+# Bindgen
+/bindings.rs
