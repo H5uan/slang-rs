@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  build-from-source:
+    # `prebuilt` (the default feature) currently panics at build time: the
+    # SHA-256 table in shader-slang-sys/src/prebuilt_checksums.rs still has
+    # placeholder digests (see that file's doc comment and
+    # scripts/compute_checksums.sh). Until those are filled in, CI builds
+    # and tests against Slang built from the `slang` git submodule instead.
+    name: build-from-source (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+          - name: macos-x86_64
+            os: macos-13
+          - name: macos-aarch64
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure Slang
+        working-directory: shader-slang-sys/slang
+        run: cmake --preset default
+
+      - name: Build Slang (release)
+        working-directory: shader-slang-sys/slang
+        run: cmake --build --preset release
+
+      - name: cargo build
+        run: cargo build --workspace --no-default-features --features build-from-source
+
+      - name: cargo test (unit tests)
+        run: cargo test --workspace --no-default-features --features build-from-source
+
+      - name: cargo test (ignored integration tests)
+        run: cargo test --no-default-features --features build-from-source -- --ignored
+
+  prebuilt-typecheck:
+    # Only type-checks the `prebuilt` feature path; does not actually
+    # download/verify a Slang binary since the checksum table isn't filled
+    # in yet. Remove this comment and switch to `cargo test` once
+    # prebuilt_checksums.rs has real digests (see
+    # shader-slang-sys/scripts/compute_checksums.sh).
+    name: prebuilt cargo check (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+          - name: macos-x86_64
+            os: macos-13
+          - name: macos-aarch64
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo check (prebuilt feature)
+        run: cargo check --workspace

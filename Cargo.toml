@@ -1,34 +1,32 @@
 [package]
-name = "slang-rs"
+name = "shader-slang"
 version = "0.1.0"
 edition = "2021"
 authors = ["Slang Rust Bindings Contributors"]
 license = "MIT OR Apache-2.0"
-description = "Rust bindings for the Slang shading language compiler"
-repository = "https://github.com/yourusername/slang-rs"
+description = "Safe, idiomatic Rust bindings for the Slang shading language compiler"
+repository = "https://github.com/yourusername/shader-slang-rs"
 keywords = ["slang", "shader", "compiler", "graphics", "gpu"]
 categories = ["graphics", "compilers", "external-ffi-bindings"]
 rust-version = "1.70"
-build = "build.rs"
 
 [dependencies]
 libc = "0.2"
-
-[build-dependencies]
-bindgen = "0.69"
-cc = "1.0"
+shader-slang-sys = { path = "shader-slang-sys" }
 
 [lib]
-name = "slang_rs"
+name = "shader_slang"
 crate-type = ["lib", "staticlib", "cdylib"]
 
 [features]
-default = ["static-link"]
-static-link = []
-dynamic-link = []
+default = ["prebuilt"]
+prebuilt = ["shader-slang-sys/prebuilt"]
+build-from-source = ["shader-slang-sys/build-from-source"]
+static-link = ["shader-slang-sys/static-link"]
+dynamic-link = ["shader-slang-sys/dynamic-link"]
 
 [workspace]
-members = ["."]
+members = [".", "shader-slang-sys"]
 
 [profile.release]
 opt-level = 3

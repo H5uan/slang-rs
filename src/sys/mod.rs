@@ -6,24 +6,24 @@
 //! - Error code conversion
 //! - String conversions
 
-use crate::ffi;
 use crate::{Error, Result};
 use std::ffi::CStr;
 
-/// SlangResult type alias from FFI
-pub type SlangResult = ffi::SlangResult;
+pub mod com;
+pub use com::{ComPtr, Unknown};
 
-/// Helper to convert a C string pointer to a Rust string
-pub fn ptr_to_string(ptr: *const std::os::raw::c_char) -> Option<String> {
+/// SlangResult type alias from FFI
+pub type SlangResult = shader_slang_sys::SlangResult;
+
+/// Helper to convert a C string pointer to a Rust string.
+///
+/// # Safety
+/// `ptr`, if non-null, must point to a valid NUL-terminated C string.
+pub unsafe fn ptr_to_string(ptr: *const std::os::raw::c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
-    unsafe {
-        CStr::from_ptr(ptr)
-            .to_str()
-            .ok()
-            .map(|s| s.to_string())
-    }
+    CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_string())
 }
 
 /// Check if a SlangResult indicates success

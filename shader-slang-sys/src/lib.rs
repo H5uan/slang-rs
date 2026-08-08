@@ -7,6 +7,8 @@
 
 #![allow(non_camel_case_types, non_snake_case)]
 
+pub mod prebuilt_checksums;
+
 // Include the generated bindings from bindgen
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
