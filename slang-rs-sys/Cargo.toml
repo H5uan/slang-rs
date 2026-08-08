@@ -1,0 +1,18 @@
+[package]
+name = "slang-rs-sys"
+version = "0.1.0"
+edition = "2024"
+description = "FFI bindings for the Slang shader language compiler"
+license = "MIT OR Apache-2.0"
+categories = ["compilers", "external-ffi-bindings"]
+links = "slang"
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+
+[build-dependencies]
+bindgen = "0.72.0"
+
+[features]
+serde = ["dep:serde"]
+source-build = []
