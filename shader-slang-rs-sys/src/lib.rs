@@ -278,6 +278,33 @@ pub struct ICooperativeTypesMetadataVtable {
 	pub getCooperativeVectorCombinationByIndex: unsafe extern "C" fn(*mut c_void, index: SlangUInt, outCombination: *mut slang_CooperativeVectorCombination) -> SlangResult,
 }
 
+#[repr(C)]
+pub struct IModulePrecompileServiceExperimentalVtable {
+	pub _base: ISlangUnknown__bindgen_vtable,
+
+	pub precompileForTarget: unsafe extern "C" fn(*mut c_void, target: SlangCompileTarget, outDiagnostics: *mut *mut ISlangBlob) -> SlangResult,
+	pub getPrecompiledTargetCode: unsafe extern "C" fn(*mut c_void, target: SlangCompileTarget, outCode: *mut *mut ISlangBlob, outDiagnostics: *mut *mut ISlangBlob) -> SlangResult,
+	pub getModuleDependencyCount: unsafe extern "C" fn(*mut c_void) -> SlangInt,
+	pub getModuleDependency: unsafe extern "C" fn(*mut c_void, dependencyIndex: SlangInt, outModule: *mut *mut slang_IModule, outDiagnostics: *mut *mut ISlangBlob) -> SlangResult,
+}
+
+#[repr(C)]
+pub struct IByteCodeRunnerVtable {
+	pub _base: ISlangUnknown__bindgen_vtable,
+
+	pub loadModule: unsafe extern "C" fn(*mut c_void, moduleBlob: *mut ISlangBlob) -> SlangResult,
+	pub selectFunctionByIndex: unsafe extern "C" fn(*mut c_void, functionIndex: u32) -> SlangResult,
+	pub findFunctionByName: unsafe extern "C" fn(*mut c_void, name: *const c_char) -> c_int,
+	pub getFunctionInfo: unsafe extern "C" fn(*mut c_void, index: u32, outInfo: *mut slang_ByteCodeFuncInfo) -> SlangResult,
+	pub getCurrentWorkingSet: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+	pub execute: unsafe extern "C" fn(*mut c_void, argumentData: *mut c_void, argumentSize: usize) -> SlangResult,
+	pub getErrorString: unsafe extern "C" fn(*mut c_void, outBlob: *mut *mut ISlangBlob),
+	pub getReturnValue: unsafe extern "C" fn(*mut c_void, outValueSize: *mut usize) -> *mut c_void,
+	pub setExtInstHandlerUserData: unsafe extern "C" fn(*mut c_void, userData: *mut c_void),
+	pub registerExtCall: unsafe extern "C" fn(*mut c_void, name: *const c_char, functionPtr: slang_VMExtFunction) -> SlangResult,
+	pub setPrintCallback: unsafe extern "C" fn(*mut c_void, callback: slang_VMPrintFunc, userData: *mut c_void) -> SlangResult,
+}
+
 // --- ABI validation ---
 //
 // The handwritten vtables above must match the interface layouts declared in
@@ -316,6 +343,8 @@ pub(crate) const IBINDLESS_RESOURCE_METADATA_METHODS: usize = 1;
 pub(crate) const ICOVERAGE_TRACING_METADATA_METHODS: usize = 4;
 pub(crate) const ISYNTHETIC_RESOURCE_METADATA_METHODS: usize = 3;
 pub(crate) const ICOOPERATIVE_TYPES_METADATA_METHODS: usize = 8;
+pub(crate) const IMODULE_PRECOMPILE_SERVICE_EXPERIMENTAL_METHODS: usize = 4;
+pub(crate) const IBYTE_CODE_RUNNER_METHODS: usize = 11;
 
 const _: () = assert!(
     std::mem::size_of::<ISlangUnknown__bindgen_vtable>()
@@ -441,6 +470,18 @@ const _: () = assert!(
         == std::mem::size_of::<ICastableVtable>()
             + ICOOPERATIVE_TYPES_METADATA_METHODS * std::mem::size_of::<*const c_void>(),
     "ICooperativeTypesMetadataVtable does not match ISlangCastable + 8 methods (slang.h)"
+);
+const _: () = assert!(
+    std::mem::size_of::<IModulePrecompileServiceExperimentalVtable>()
+        == std::mem::size_of::<ISlangUnknown__bindgen_vtable>()
+            + IMODULE_PRECOMPILE_SERVICE_EXPERIMENTAL_METHODS * std::mem::size_of::<*const c_void>(),
+    "IModulePrecompileServiceExperimentalVtable does not match ISlangUnknown + 4 methods (slang.h)"
+);
+const _: () = assert!(
+    std::mem::size_of::<IByteCodeRunnerVtable>()
+        == std::mem::size_of::<ISlangUnknown__bindgen_vtable>()
+            + IBYTE_CODE_RUNNER_METHODS * std::mem::size_of::<*const c_void>(),
+    "IByteCodeRunnerVtable does not match ISlangUnknown + 11 methods (slang.h)"
 );
 
 #[cfg(test)]
@@ -588,6 +629,11 @@ mod tests {
             ("ICoverageTracingMetadata", ICOVERAGE_TRACING_METADATA_METHODS),
             ("ISyntheticResourceMetadata", ISYNTHETIC_RESOURCE_METADATA_METHODS),
             ("ICooperativeTypesMetadata", ICOOPERATIVE_TYPES_METADATA_METHODS),
+            (
+                "IModulePrecompileService_Experimental",
+                IMODULE_PRECOMPILE_SERVICE_EXPERIMENTAL_METHODS,
+            ),
+            ("IByteCodeRunner", IBYTE_CODE_RUNNER_METHODS),
         ] {
             assert_eq!(
                 count_pure_virtual_methods(&source, interface),

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Remaining misc capabilities
+
+- `ModulePrecompileService` (experimental `IModulePrecompileService_Experimental`): RAII wrapper obtained via `Module::precompile_service`, with `precompile_for_target`, `precompiled_target_code`, `module_dependency_count`, `module_dependency`.
+- Metadata info accessors: `CoverageTracingMetadata::entry_info` / `buffer_info` (returning the new `CoverageEntryInfo` / `CoverageBufferInfo` structs plus `CoverageEntryKind` / `CoverageCounterMode` / `CoverageBranchArmKind` re-exports), `SyntheticResourceMetadata::resource_info` / `find_resource_index_by_id` (returning `SyntheticResourceInfo`, plus `SyntheticResourceScope` / `SyntheticResourceAccess` re-exports), and the four `CooperativeTypesMetadata::cooperative_*_by_index` methods (returning the re-exported `CooperativeMatrixType` / `CooperativeMatrixCombination` / `CooperativeVectorTypeUsageInfo` / `CooperativeVectorCombination` sys structs).
+- `GlobalSession`: `add_builtins`, `set_default_downstream_compiler` / `default_downstream_compiler`, `set_downstream_compiler_for_transition` / `downstream_compiler_for_transition`, `downstream_compiler_version`, and the experimental builtin-module trio `compile_builtin_module` / `load_builtin_module` / `save_builtin_module` (with the `BuiltinModuleName` re-export).
+- `Session::load_module_from_source`: loads a module from a `Blob` source; `Blob::new` builds a blob from raw bytes (`slang_createBlob`).
+- `build_tag_string` free function (`spGetBuildTagString`): the Slang build tag without creating a global session.
+- `ByteCodeRunner` (experimental `IByteCodeRunner`) and `disassemble_byte_code`: creation plus the module/function selection surface (`load_module`, `select_function_by_index`, `find_function_by_name`, `function_info`, `error_string`, with the `ByteCodeFuncInfo` re-export); the raw-pointer/callback-driven methods (`execute`, `registerExtCall`, ...) stay unwrapped.
+- sys crate: handwritten `IModulePrecompileServiceExperimentalVtable` / `IByteCodeRunnerVtable` (verified against slang.h by the ABI method-count test); `spGetBuildTagString` added to the bindgen allowlist.
+
 ### Extended file system interfaces
 
 - `MutableFileSystem` (`ISlangMutableFileSystem`): RAII wrapper with full path management (`load_file`, `file_unique_identity`, `calc_combined_path`, `path_type`, `get_path`, `clear_cache`, `enumerate_path_contents`, `os_path_kind`) and write operations (`save_file`, `save_file_blob`, `remove`, `create_directory`). New `PathType` / `PathKind` / `OSPathKind` re-exports.

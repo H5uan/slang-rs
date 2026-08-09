@@ -85,6 +85,7 @@ fn main() {
 		.clang_arg("-std=c++17")
 		.allowlist_function("spReflection.*")
 		.allowlist_function("spComputeStringHash")
+		.allowlist_function("spGetBuildTagString")
 		.allowlist_function("slang_.*")
 		.allowlist_type("slang.*")
 		// Types referenced by the handwritten ISlangFileSystemExt /

@@ -77,11 +77,20 @@ pub use sys::{
 	SlangReflectionGenericArgType as GenericArgType, SlangResourceAccess as ResourceAccess,
 	SlangResourceShape as ResourceShape, SlangScalarType as ScalarType,
 	SlangSourceLanguage as SourceLanguage, SlangStage as Stage, SlangTargetFlags as TargetFlags,
-	SlangTypeKind as TypeKind, SlangUUID as UUID,
+	SlangTypeKind as TypeKind, SlangUUID as UUID, slang_BuiltinModuleName as BuiltinModuleName,
+	slang_ByteCodeFuncInfo as ByteCodeFuncInfo,
 	slang_CompileCoreModuleFlag_Enum as CompileCoreModuleFlag,
 	slang_CompileCoreModuleFlags as CompileCoreModuleFlags,
 	slang_CompilerOptionName as CompilerOptionName, slang_ContainerType as ContainerType,
+	slang_CooperativeMatrixCombination as CooperativeMatrixCombination,
+	slang_CooperativeMatrixType as CooperativeMatrixType,
+	slang_CooperativeVectorCombination as CooperativeVectorCombination,
+	slang_CooperativeVectorTypeUsageInfo as CooperativeVectorTypeUsageInfo,
+	slang_CoverageBranchArmKind as CoverageBranchArmKind,
+	slang_CoverageCounterMode as CoverageCounterMode, slang_CoverageEntryKind as CoverageEntryKind,
 	slang_Modifier as Modifier, slang_SessionFlags as SessionFlags,
+	slang_SyntheticResourceAccess as SyntheticResourceAccess,
+	slang_SyntheticResourceScope as SyntheticResourceScope,
 };
 
 macro_rules! vcall {
@@ -180,6 +189,18 @@ pub(crate) unsafe fn str_from_slang<'a>(ptr: *const i8) -> Option<&'a str> {
 	}
 	// SAFETY: upheld by the caller.
 	unsafe { CStr::from_ptr(ptr) }.to_str().ok()
+}
+
+/// Gets the build version tag string of this Slang build, as produced by
+/// `git describe --tags` (`spGetBuildTagString` in slang.h). Unlike
+/// [`GlobalSession::build_tag_string`], this does not require creating a
+/// global session. Returns `None` when the string is unavailable or not valid
+/// UTF-8.
+pub fn build_tag_string() -> Option<&'static str> {
+	// SAFETY: `spGetBuildTagString` returns a pointer to a static string owned
+	// by the Slang library, valid for as long as the library stays loaded
+	// (which outlives any use through this crate).
+	unsafe { str_from_slang(sys::spGetBuildTagString()) }
 }
 
 /// The internal ID of a compilation profile, as looked up by
@@ -335,6 +356,18 @@ unsafe impl Interface for Blob {
 }
 
 impl Blob {
+	/// Creates a Slang blob owning a copy of `data` (`slang_createBlob`).
+	/// Panics when Slang fails to allocate the blob.
+	pub fn new(data: &[u8]) -> Blob {
+		// SAFETY: `data` points to `data.len()` readable bytes;
+		// `slang_createBlob` copies them into the new blob and returns a new
+		// reference owned by the caller.
+		let blob = unsafe { sys::slang_createBlob(data.as_ptr() as *const c_void, data.len()) };
+		Blob(IUnknown(
+			std::ptr::NonNull::new(blob as *mut _).expect("slang_createBlob returned null"),
+		))
+	}
+
 	/// Returns the blob's contents as a byte slice.
 	pub fn as_slice(&self) -> &[u8] {
 		let ptr = vcall!(self, getBufferPointer());
@@ -865,6 +898,156 @@ impl GlobalSession {
 			std::ptr::NonNull::new(blob as *mut _).unwrap(),
 		)))
 	}
+
+	/// Adds new builtin declarations, given as Slang source, to be used in
+	/// subsequent compiles on sessions created from this global session
+	/// (`IGlobalSession::addBuiltins`). `source_path` is used for diagnostics.
+	pub fn add_builtins(&self, source_path: &str, source_string: &str) {
+		let source_path = CString::new(source_path).unwrap();
+		let source_string = CString::new(source_string).unwrap();
+		vcall!(
+			self,
+			addBuiltins(source_path.as_ptr(), source_string.as_ptr())
+		);
+	}
+
+	/// Sets the default downstream compiler for a source language
+	/// (`IGlobalSession::setDefaultDownstreamCompiler`). The default is only
+	/// used when Slang cannot pick a better compiler for the requested target.
+	pub fn set_default_downstream_compiler(
+		&self,
+		source_language: SourceLanguage,
+		default_compiler: PassThrough,
+	) -> Result<()> {
+		let result = vcall!(
+			self,
+			setDefaultDownstreamCompiler(source_language, default_compiler)
+		);
+		// `setDefaultDownstreamCompiler` takes no diagnostics out-pointer; the
+		// result code is the only signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(())
+	}
+
+	/// Gets the default downstream compiler for a source language
+	/// (`IGlobalSession::getDefaultDownstreamCompiler`).
+	pub fn default_downstream_compiler(&self, source_language: SourceLanguage) -> PassThrough {
+		vcall!(self, getDefaultDownstreamCompiler(source_language))
+	}
+
+	/// Sets the downstream compiler to use for a transition from the `source`
+	/// code gen target to the `target` code gen target
+	/// (`IGlobalSession::setDownstreamCompilerForTransition`).
+	pub fn set_downstream_compiler_for_transition(
+		&self,
+		source: CompileTarget,
+		target: CompileTarget,
+		compiler: PassThrough,
+	) {
+		vcall!(
+			self,
+			setDownstreamCompilerForTransition(source, target, compiler)
+		);
+	}
+
+	/// Gets the downstream compiler used for a transition from the `source`
+	/// code gen target to the `target` code gen target
+	/// (`IGlobalSession::getDownstreamCompilerForTransition`). Returns
+	/// [`PassThrough::None`] when no compiler is defined for the transition.
+	pub fn downstream_compiler_for_transition(
+		&self,
+		source: CompileTarget,
+		target: CompileTarget,
+	) -> PassThrough {
+		vcall!(self, getDownstreamCompilerForTransition(source, target))
+	}
+
+	/// Gets the version of the downstream compiler that Slang will actually
+	/// load and use for `pass_through`
+	/// (`IGlobalSession::getDownstreamCompilerVersion`), applying the same lazy
+	/// discovery used during compilation. The first call for a given
+	/// `pass_through` loads the downstream library into the process, so this is
+	/// not a cheap accessor. Some downstream compilers (e.g. the glslang
+	/// family) always report `(0, 0)`.
+	///
+	/// Returns `Err` when the compiler cannot be located or loaded; the result
+	/// code alone does not distinguish an invalid `pass_through` from a
+	/// compiler that is simply not installed.
+	pub fn downstream_compiler_version(&self, pass_through: PassThrough) -> Result<(i32, i32)> {
+		let mut major = 0;
+		let mut minor = 0;
+		let result = vcall!(
+			self,
+			getDownstreamCompilerVersion(pass_through, &mut major, &mut minor)
+		);
+		// `getDownstreamCompilerVersion` takes no diagnostics out-pointer; the
+		// result code is the only signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok((major, minor))
+	}
+
+	/// Compiles a builtin module from embedded source
+	/// (`IGlobalSession::compileBuiltinModule`). Fails if the builtin module is
+	/// already available on this global session.
+	///
+	/// NOTE: this API is experimental in Slang.
+	pub fn compile_builtin_module(
+		&self,
+		module: BuiltinModuleName,
+		flags: CompileCoreModuleFlags,
+	) -> Result<()> {
+		let result = vcall!(self, compileBuiltinModule(module, flags));
+		// `compileBuiltinModule` takes no diagnostics out-pointer; the result
+		// code is the only signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(())
+	}
+
+	/// Loads a serialized builtin module, as produced by
+	/// [`GlobalSession::save_builtin_module`]
+	/// (`IGlobalSession::loadBuiltinModule`).
+	///
+	/// NOTE: this API is experimental in Slang.
+	pub fn load_builtin_module(&self, module: BuiltinModuleName, data: &[u8]) -> Result<()> {
+		let result = vcall!(
+			self,
+			loadBuiltinModule(module, data.as_ptr() as _, data.len())
+		);
+		// `loadBuiltinModule` takes no diagnostics out-pointer; the result code
+		// is the only signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(())
+	}
+
+	/// Serializes a builtin module of this global session into a blob, suitable
+	/// for a later [`GlobalSession::load_builtin_module`] call
+	/// (`IGlobalSession::saveBuiltinModule`).
+	///
+	/// NOTE: this API is experimental in Slang.
+	pub fn save_builtin_module(
+		&self,
+		module: BuiltinModuleName,
+		archive_type: ArchiveType,
+	) -> Result<Blob> {
+		let mut blob = null_mut();
+		let result = vcall!(self, saveBuiltinModule(module, archive_type, &mut blob));
+		// `saveBuiltinModule` takes no diagnostics out-pointer; the result code
+		// is the only signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(Blob(IUnknown(
+			std::ptr::NonNull::new(blob as *mut _).unwrap(),
+		)))
+	}
 }
 
 /// The result of [`GlobalSession::parse_command_line_arguments`]: a
@@ -1022,6 +1205,54 @@ impl Session {
 			// "Code loaded and compiled within a session is owned by the
 			// session"). Adding a reference turns it into an owned pointer
 			// matching the `IUnknown` RAII drop semantics.
+			unsafe { (module.as_unknown().vtable().ISlangUnknown_addRef)(module.as_raw()) };
+			Ok(module)
+		}
+	}
+
+	/// Loads a module from an in-memory Slang source blob
+	/// (`ISession::loadModuleFromSource`). Unlike
+	/// [`Session::load_module_from_source_string`], the source does not have to
+	/// be valid UTF-8; a blob can be built from raw bytes with [`Blob::new`].
+	/// `module_name` is the name the module is registered under; `path` is used
+	/// for diagnostics and for resolving relative paths. Returns `Err` when the
+	/// source fails to compile; the error carries the compiler diagnostics blob
+	/// when Slang produced one.
+	pub fn load_module_from_source(
+		&self,
+		module_name: &str,
+		path: &str,
+		source: &Blob,
+	) -> Result<Module> {
+		let module_name = CString::new(module_name).unwrap();
+		let path = CString::new(path).unwrap();
+		let mut diagnostics = null_mut();
+
+		let module = vcall!(
+			self,
+			loadModuleFromSource(
+				module_name.as_ptr(),
+				path.as_ptr(),
+				source.as_raw(),
+				&mut diagnostics
+			)
+		);
+
+		if module.is_null() {
+			// The module pointer is the only error signal here; Slang usually
+			// fills the diagnostics blob but is not guaranteed to, so fall
+			// back to a generic failure code instead of dereferencing null.
+			Err(error_from_diagnostics(diagnostics))
+		} else {
+			let module = Module(IUnknown(std::ptr::NonNull::new(module as *mut _).unwrap()));
+			// SAFETY: `module` is non-null, so the vtable call is valid.
+			// `loadModule`/`loadModuleFromSource`/`loadModuleFromSourceString`/
+			// `loadModuleFromIRBlob` return a borrowed reference — code loaded
+			// in a session is owned by the session (see the ISession
+			// documentation in slang.h: "Code loaded and compiled within a
+			// session is owned by the session"). Adding a reference turns it
+			// into an owned pointer matching the `IUnknown` RAII drop
+			// semantics.
 			unsafe { (module.as_unknown().vtable().ISlangUnknown_addRef)(module.as_raw()) };
 			Ok(module)
 		}
@@ -1744,6 +1975,124 @@ impl CoverageTracingMetadata {
 	pub fn entry_count(&self) -> u32 {
 		vcall!(self, getEntryCount())
 	}
+
+	/// Gets the attribution info of the source coverage entry at `index`
+	/// (`ICoverageTracingMetadata::getEntryInfo`). Valid indices are
+	/// `0..self.entry_count()`; an out-of-range index returns `Err`.
+	pub fn entry_info(&self, index: u32) -> Result<CoverageEntryInfo<'_>> {
+		let mut info = sys::slang_CoverageEntryInfo {
+			structSize: std::mem::size_of::<sys::slang_CoverageEntryInfo>(),
+			// SAFETY: `slang_CoverageEntryInfo` is a C struct of scalars and
+			// pointers; an all-zero value is a valid instance.
+			..unsafe { std::mem::zeroed() }
+		};
+		let result = vcall!(self, getEntryInfo(index, &mut info));
+		// `getEntryInfo` takes no diagnostics out-pointer; the result code is
+		// the only error signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		// SAFETY: per slang.h, the string pointers returned through
+		// `CoverageEntryInfo` remain valid for the lifetime of the metadata
+		// object, which outlives the `&self` borrow the result is tied to.
+		Ok(unsafe {
+			CoverageEntryInfo {
+				file: str_from_slang(info.file),
+				line: info.line,
+				counter_index: info.counterIndex,
+				kind: info.kind,
+				counter_mode: info.counterMode,
+				start_column: info.startColumn,
+				end_line: info.endLine,
+				end_column: info.endColumn,
+				function_name: str_from_slang(info.functionName),
+				function_mangled_name: str_from_slang(info.functionMangledName),
+				branch_site_id: info.branchSiteID,
+				branch_arm_id: info.branchArmID,
+				branch_arm_kind: info.branchArmKind,
+			}
+		})
+	}
+
+	/// Gets the descriptor binding of the synthesized coverage buffer
+	/// (`ICoverageTracingMetadata::getBufferInfo`). Kept by Slang for
+	/// compatibility; new integrations should prefer
+	/// [`SyntheticResourceMetadata`], which also reports CPU/CUDA marshaling
+	/// locations.
+	pub fn buffer_info(&self) -> Result<CoverageBufferInfo> {
+		let mut info = sys::slang_CoverageBufferInfo {
+			structSize: std::mem::size_of::<sys::slang_CoverageBufferInfo>(),
+			// SAFETY: `slang_CoverageBufferInfo` is a C struct of scalars; an
+			// all-zero value is a valid instance.
+			..unsafe { std::mem::zeroed() }
+		};
+		let result = vcall!(self, getBufferInfo(&mut info));
+		// `getBufferInfo` takes no diagnostics out-pointer; the result code is
+		// the only error signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(CoverageBufferInfo {
+			space: info.space,
+			binding: info.binding,
+			element_byte_width: info.elementByteWidth,
+		})
+	}
+}
+
+/// Per-coverage-entry attribution returned by
+/// [`CoverageTracingMetadata::entry_info`] (`slang::CoverageEntryInfo` in
+/// slang.h, minus the leading `structSize` ABI field). Borrows strings owned
+/// by the metadata object.
+pub struct CoverageEntryInfo<'a> {
+	/// Source file for this coverage entry, if it could be attributed to a
+	/// real source file.
+	pub file: Option<&'a str>,
+	/// 1-based source line for this entry, or 0 when unattributed.
+	pub line: u32,
+	/// Counter slot used by this entry, or the invalid-counter sentinel when
+	/// the entry has no runtime counter.
+	pub counter_index: u32,
+	/// Semantic kind of this source coverage entry.
+	pub kind: CoverageEntryKind,
+	/// Runtime accumulation mode for `counter_index`.
+	pub counter_mode: CoverageCounterMode,
+	/// 1-based inclusive start column, or 0 when unavailable.
+	pub start_column: u32,
+	/// 1-based end line of this entry's half-open end coordinate, or 0 when
+	/// the exact range is unavailable.
+	pub end_line: u32,
+	/// 1-based exclusive end column, or 0 when unavailable.
+	pub end_column: u32,
+	/// Function display name for function coverage entries, when applicable.
+	pub function_name: Option<&'a str>,
+	/// Stable mangled function name for function coverage entries, when
+	/// applicable.
+	pub function_mangled_name: Option<&'a str>,
+	/// Stable branch-site identifier within the metadata object, or 0 when not
+	/// applicable.
+	pub branch_site_id: u32,
+	/// Stable branch-arm identifier within `branch_site_id`, or 0 when not
+	/// applicable.
+	pub branch_arm_id: u32,
+	/// Branch arm semantic for branch coverage entries.
+	pub branch_arm_kind: CoverageBranchArmKind,
+}
+
+/// Coverage-buffer descriptor binding info returned by
+/// [`CoverageTracingMetadata::buffer_info`] (`slang::CoverageBufferInfo` in
+/// slang.h, minus the leading `structSize` ABI field). A `-1` sentinel means
+/// the value is not reported for the current target.
+pub struct CoverageBufferInfo {
+	/// Register space the coverage buffer is bound to (D3D12 `space`, Vulkan
+	/// descriptor set), or -1 if not assigned for this target.
+	pub space: i32,
+	/// Binding index the coverage buffer is bound at (D3D12 `register`, Vulkan
+	/// `binding`), or -1 if not assigned for this target.
+	pub binding: i32,
+	/// Byte width of one counter slot in the synthesized buffer (4 for
+	/// `RWStructuredBuffer<uint>`, 8 for `RWStructuredBuffer<uint64_t>`).
+	pub element_byte_width: u32,
 }
 
 /// Metadata for compiler-synthesized bindable resources
@@ -1764,6 +2113,97 @@ impl SyntheticResourceMetadata {
 	pub fn resource_count(&self) -> u32 {
 		vcall!(self, getResourceCount())
 	}
+
+	/// Gets the info of the synthetic resource at `index`
+	/// (`ISyntheticResourceMetadata::getResourceInfo`). Valid indices are
+	/// `0..self.resource_count()`; an out-of-range index returns `Err`.
+	pub fn resource_info(&self, index: u32) -> Result<SyntheticResourceInfo<'_>> {
+		let mut info = sys::slang_SyntheticResourceInfo {
+			structSize: std::mem::size_of::<sys::slang_SyntheticResourceInfo>(),
+			// SAFETY: `slang_SyntheticResourceInfo` is a C struct of scalars
+			// and pointers; an all-zero value is a valid instance.
+			..unsafe { std::mem::zeroed() }
+		};
+		let result = vcall!(self, getResourceInfo(index, &mut info));
+		// `getResourceInfo` takes no diagnostics out-pointer; the result code
+		// is the only error signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		// SAFETY: per slang.h, the string pointers returned through
+		// `SyntheticResourceInfo` remain valid for the lifetime of the metadata
+		// object, which outlives the `&self` borrow the result is tied to.
+		Ok(unsafe {
+			SyntheticResourceInfo {
+				id: info.id,
+				// SAFETY: `slang::BindingType` (the enum class stored in the sys
+				// struct) and the C `SlangBindingType` are both u32 enums whose
+				// values slang.h defines one in terms of the other, so the bit
+				// patterns are interchangeable.
+				binding_type: std::mem::transmute::<sys::slang_BindingType, BindingType>(
+					info.bindingType,
+				),
+				array_size: info.arraySize,
+				scope: info.scope,
+				access: info.access,
+				entry_point_index: info.entryPointIndex,
+				space: info.space,
+				binding: info.binding,
+				uniform_offset: info.uniformOffset,
+				uniform_stride: info.uniformStride,
+				debug_name: str_from_slang(info.debugName),
+			}
+		})
+	}
+
+	/// Finds the index of the synthetic resource with the given `id`
+	/// (`ISyntheticResourceMetadata::findResourceIndexByID`). Returns `Err`
+	/// (with `SLANG_E_NOT_FOUND`) when no resource carries that id; id 0 is
+	/// reserved as the "unassigned" sentinel and always fails.
+	pub fn find_resource_index_by_id(&self, id: u32) -> Result<u32> {
+		let mut index = 0;
+		let result = vcall!(self, findResourceIndexByID(id, &mut index));
+		// `findResourceIndexByID` takes no diagnostics out-pointer; the result
+		// code is the only error signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(index)
+	}
+}
+
+/// Info of a compiler-synthesized bindable resource returned by
+/// [`SyntheticResourceMetadata::resource_info`]
+/// (`slang::SyntheticResourceInfo` in slang.h, minus the leading `structSize`
+/// ABI field). Borrows strings owned by the metadata object. See slang.h for
+/// the `-1`/`0` sentinel conventions of the location fields.
+pub struct SyntheticResourceInfo<'a> {
+	/// Stable, opaque, non-zero synthetic resource identifier within the
+	/// compiled program.
+	pub id: u32,
+	/// The Slang binding kind represented by this synthetic resource.
+	pub binding_type: BindingType,
+	/// Number of logical resources in the synthetic binding.
+	pub array_size: u32,
+	/// Whether the resource is global/root-scoped or attached to a specific
+	/// entry point.
+	pub scope: SyntheticResourceScope,
+	/// Intended access pattern for the resource.
+	pub access: SyntheticResourceAccess,
+	/// Entry point index when `scope` is entry-point scoped, else -1.
+	pub entry_point_index: i32,
+	/// Descriptor space (D3D12 `space`, Vulkan descriptor set), or -1 when not
+	/// reported for this target.
+	pub space: i32,
+	/// Descriptor binding index, or -1 when unavailable for this target.
+	pub binding: i32,
+	/// CPU/CUDA-style marshaling location in bytes, or -1 when unavailable.
+	pub uniform_offset: i32,
+	/// Byte stride between adjacent logical elements when CPU/CUDA-style
+	/// marshaling is reported.
+	pub uniform_stride: i32,
+	/// Optional stable debug name for the synthetic resource.
+	pub debug_name: Option<&'a str>,
 }
 
 /// Cooperative matrix and vector metadata (`ICooperativeTypesMetadata` in
@@ -1796,6 +2236,91 @@ impl CooperativeTypesMetadata {
 	/// Number of cooperative vector combinations used by the compiled target.
 	pub fn cooperative_vector_combination_count(&self) -> u64 {
 		vcall!(self, getCooperativeVectorCombinationCount())
+	}
+
+	/// Gets the cooperative matrix type at `index`
+	/// (`ICooperativeTypesMetadata::getCooperativeMatrixTypeByIndex`). Valid
+	/// indices are `0..self.cooperative_matrix_type_count()`; an out-of-range
+	/// index returns `Err`.
+	pub fn cooperative_matrix_type_by_index(&self, index: u64) -> Result<CooperativeMatrixType> {
+		// SAFETY: `slang_CooperativeMatrixType` is a C struct of scalars; an
+		// all-zero value is a valid instance.
+		let mut ty: sys::slang_CooperativeMatrixType = unsafe { std::mem::zeroed() };
+		let result = vcall!(self, getCooperativeMatrixTypeByIndex(index, &mut ty));
+		// `getCooperativeMatrixTypeByIndex` takes no diagnostics out-pointer;
+		// the result code is the only error signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(ty)
+	}
+
+	/// Gets the cooperative matrix combination at `index`
+	/// (`ICooperativeTypesMetadata::getCooperativeMatrixCombinationByIndex`).
+	/// Valid indices are `0..self.cooperative_matrix_combination_count()`; an
+	/// out-of-range index returns `Err`.
+	pub fn cooperative_matrix_combination_by_index(
+		&self,
+		index: u64,
+	) -> Result<CooperativeMatrixCombination> {
+		// SAFETY: `slang_CooperativeMatrixCombination` is a C struct of
+		// scalars; an all-zero value is a valid instance.
+		let mut combination: sys::slang_CooperativeMatrixCombination =
+			unsafe { std::mem::zeroed() };
+		let result = vcall!(
+			self,
+			getCooperativeMatrixCombinationByIndex(index, &mut combination)
+		);
+		// `getCooperativeMatrixCombinationByIndex` takes no diagnostics
+		// out-pointer; the result code is the only error signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(combination)
+	}
+
+	/// Gets the cooperative vector type-usage record at `index`
+	/// (`ICooperativeTypesMetadata::getCooperativeVectorTypeByIndex`). Valid
+	/// indices are `0..self.cooperative_vector_type_count()`; an out-of-range
+	/// index returns `Err`.
+	pub fn cooperative_vector_type_by_index(
+		&self,
+		index: u64,
+	) -> Result<CooperativeVectorTypeUsageInfo> {
+		// SAFETY: `slang_CooperativeVectorTypeUsageInfo` is a C struct of
+		// scalars; an all-zero value is a valid instance.
+		let mut ty: sys::slang_CooperativeVectorTypeUsageInfo = unsafe { std::mem::zeroed() };
+		let result = vcall!(self, getCooperativeVectorTypeByIndex(index, &mut ty));
+		// `getCooperativeVectorTypeByIndex` takes no diagnostics out-pointer;
+		// the result code is the only error signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(ty)
+	}
+
+	/// Gets the cooperative vector combination at `index`
+	/// (`ICooperativeTypesMetadata::getCooperativeVectorCombinationByIndex`).
+	/// Valid indices are `0..self.cooperative_vector_combination_count()`; an
+	/// out-of-range index returns `Err`.
+	pub fn cooperative_vector_combination_by_index(
+		&self,
+		index: u64,
+	) -> Result<CooperativeVectorCombination> {
+		// SAFETY: `slang_CooperativeVectorCombination` is a C struct of
+		// scalars; an all-zero value is a valid instance.
+		let mut combination: sys::slang_CooperativeVectorCombination =
+			unsafe { std::mem::zeroed() };
+		let result = vcall!(
+			self,
+			getCooperativeVectorCombinationByIndex(index, &mut combination)
+		);
+		// `getCooperativeVectorCombinationByIndex` takes no diagnostics
+		// out-pointer; the result code is the only error signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(combination)
 	}
 }
 
@@ -2349,6 +2874,214 @@ impl Module {
 		let blob = Blob(IUnknown(std::ptr::NonNull::new(blob as *mut _).unwrap()));
 		Ok(String::from_utf8_lossy(blob.as_slice()).into_owned())
 	}
+
+	/// Queries this module for the experimental precompile service
+	/// ([`ModulePrecompileService`]). Returns `None` when the module object
+	/// does not implement the service interface.
+	pub fn precompile_service(&self) -> Option<ModulePrecompileService> {
+		self.as_unknown().query_interface()
+	}
+}
+
+/// Experimental interface for target precompilation of a Slang module
+/// (`IModulePrecompileService_Experimental` in slang.h). Obtained from
+/// [`Module::precompile_service`].
+///
+/// NOTE: this API is experimental in Slang.
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct ModulePrecompileService(IUnknown);
+
+unsafe impl Interface for ModulePrecompileService {
+	type Vtable = sys::IModulePrecompileServiceExperimentalVtable;
+	const IID: UUID = uuid(0x8e12_e8e3_5fcd_433e_afcb_13a0_88bc_5ee5);
+}
+
+impl ModulePrecompileService {
+	/// Precompiles the module for `target` and embeds the resulting target
+	/// library in the module
+	/// (`IModulePrecompileService_Experimental::precompileForTarget`).
+	///
+	/// This mutates the module by adding precompiled target IR and temporary
+	/// export metadata; per slang.h it is not thread-safe — callers must
+	/// externally synchronize access to the module and must not call this
+	/// concurrently with other operations on the same module or session.
+	///
+	/// Returns `Err` when precompilation fails; the error carries the
+	/// diagnostics blob when Slang produced one.
+	pub fn precompile_for_target(&self, target: CompileTarget) -> Result<()> {
+		let mut diagnostics = null_mut();
+		result_from_blob(
+			vcall!(self, precompileForTarget(target, &mut diagnostics)),
+			diagnostics,
+		)
+	}
+
+	/// Gets the precompiled target code embedded by a previous
+	/// [`ModulePrecompileService::precompile_for_target`] call
+	/// (`IModulePrecompileService_Experimental::getPrecompiledTargetCode`).
+	///
+	/// Returns `Err` when the module has not been precompiled for `target`;
+	/// the error carries the diagnostics blob when Slang produced one.
+	pub fn precompiled_target_code(&self, target: CompileTarget) -> Result<Blob> {
+		let mut code = null_mut();
+		let mut diagnostics = null_mut();
+
+		result_from_blob(
+			vcall!(
+				self,
+				getPrecompiledTargetCode(target, &mut code, &mut diagnostics)
+			),
+			diagnostics,
+		)?;
+
+		Ok(Blob(IUnknown(
+			std::ptr::NonNull::new(code as *mut _).unwrap(),
+		)))
+	}
+
+	/// Gets the number of modules this module depends on
+	/// (`IModulePrecompileService_Experimental::getModuleDependencyCount`).
+	pub fn module_dependency_count(&self) -> i64 {
+		vcall!(self, getModuleDependencyCount())
+	}
+
+	/// Gets the module dependency at `index`
+	/// (`IModulePrecompileService_Experimental::getModuleDependency`).
+	///
+	/// Returns `Err` when `index` is out of range. Note Slang signals this
+	/// inconsistently per implementation: with `SLANG_E_INVALID_ARG`, or with
+	/// `SLANG_OK` and a null module pointer (the plain-`Module`
+	/// implementation) — the wrapper maps both to `Err`.
+	pub fn module_dependency(&self, index: i64) -> Result<Module> {
+		let mut module = null_mut();
+		let mut diagnostics = null_mut();
+
+		result_from_blob(
+			vcall!(
+				self,
+				getModuleDependency(index, &mut module, &mut diagnostics)
+			),
+			diagnostics,
+		)?;
+
+		let Some(module) = std::ptr::NonNull::new(module as *mut _) else {
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Module(IUnknown(module)))
+	}
+}
+
+/// An owned reference to a Slang bytecode runner (`IByteCodeRunner` in
+/// slang.h): an experimental interpreter that executes Slang bytecode modules.
+/// Created with [`ByteCodeRunner::new`].
+///
+/// This wrapper covers the module/function selection surface. The raw-pointer
+/// and callback-driven methods of `IByteCodeRunner` (`execute`,
+/// `getCurrentWorkingSet`, `getReturnValue`, `registerExtCall`,
+/// `setPrintCallback`, `setExtInstHandlerUserData`) are deliberately not
+/// wrapped; the sys vtable still carries their slots.
+///
+/// NOTE: this API is experimental in Slang.
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct ByteCodeRunner(IUnknown);
+
+unsafe impl Interface for ByteCodeRunner {
+	type Vtable = sys::IByteCodeRunnerVtable;
+	const IID: UUID = uuid(0xafda_b195_361f_42cb_9513_9006_261d_d8cd);
+}
+
+impl ByteCodeRunner {
+	/// Creates a bytecode runner with the default description
+	/// (`slang_createByteCodeRunner`).
+	pub fn new() -> Result<ByteCodeRunner> {
+		let desc = sys::slang_ByteCodeRunnerDesc {
+			structSize: std::mem::size_of::<sys::slang_ByteCodeRunnerDesc>(),
+		};
+		let mut runner = null_mut();
+		// SAFETY: `desc` and `runner` are valid in/out pointers; on success the
+		// out-pointer receives a new reference owned by the caller.
+		let result = unsafe { sys::slang_createByteCodeRunner(&desc, &mut runner) };
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(ByteCodeRunner(IUnknown(
+			std::ptr::NonNull::new(runner as *mut _).unwrap(),
+		)))
+	}
+
+	/// Loads a bytecode module blob into the execution context
+	/// (`IByteCodeRunner::loadModule`).
+	pub fn load_module(&self, module: &Blob) -> Result<()> {
+		let result = vcall!(self, loadModule(module.as_raw()));
+		// `loadModule` takes no diagnostics out-pointer; the result code is
+		// the only error signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(())
+	}
+
+	/// Selects the function at `index` for execution
+	/// (`IByteCodeRunner::selectFunctionByIndex`).
+	pub fn select_function_by_index(&self, index: u32) -> Result<()> {
+		let result = vcall!(self, selectFunctionByIndex(index));
+		// `selectFunctionByIndex` takes no diagnostics out-pointer; the result
+		// code is the only error signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(())
+	}
+
+	/// Finds the index of the function with `name`
+	/// (`IByteCodeRunner::findFunctionByName`), or -1 when the loaded module
+	/// has no such function (or no module is loaded).
+	pub fn find_function_by_name(&self, name: &str) -> i32 {
+		let name = CString::new(name).unwrap();
+		vcall!(self, findFunctionByName(name.as_ptr()))
+	}
+
+	/// Gets the info of the function at `index`
+	/// (`IByteCodeRunner::getFunctionInfo`).
+	pub fn function_info(&self, index: u32) -> Result<ByteCodeFuncInfo> {
+		// SAFETY: `slang_ByteCodeFuncInfo` is a C struct of scalars; an
+		// all-zero value is a valid instance.
+		let mut info: sys::slang_ByteCodeFuncInfo = unsafe { std::mem::zeroed() };
+		let result = vcall!(self, getFunctionInfo(index, &mut info));
+		// `getFunctionInfo` takes no diagnostics out-pointer; the result code
+		// is the only error signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(info)
+	}
+
+	/// Gets the runner's error string, if any
+	/// (`IByteCodeRunner::getErrorString`).
+	pub fn error_string(&self) -> Option<Blob> {
+		let mut blob = null_mut();
+		vcall!(self, getErrorString(&mut blob));
+		Some(Blob(IUnknown(std::ptr::NonNull::new(blob as *mut _)?)))
+	}
+}
+
+/// Disassembles a Slang bytecode module blob into human-readable text
+/// (`slang_disassembleByteCode` in slang.h).
+///
+/// NOTE: this API is experimental in Slang.
+pub fn disassemble_byte_code(module: &Blob) -> Result<Blob> {
+	let mut disassembly = null_mut();
+	// SAFETY: both pointers are valid; on success the out-pointer receives a
+	// new reference owned by the caller.
+	let result = unsafe { sys::slang_disassembleByteCode(module.as_raw(), &mut disassembly) };
+	if !succeeded(result) {
+		return Err(Error::Code(result));
+	}
+	Ok(Blob(IUnknown(
+		std::ptr::NonNull::new(disassembly as *mut _).unwrap(),
+	)))
 }
 
 /// Description of a code generation target (`slang::TargetDesc` in slang.h),

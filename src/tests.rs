@@ -1713,3 +1713,191 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID)
 	let target_library = program2.target_host_callable(0).unwrap();
 	assert!(target_library.find_symbol("computeMain").is_some());
 }
+
+// --- M7c: misc remaining capability tests ---
+
+#[test]
+fn build_tag_string_free_function() {
+	// The free function must agree with the global-session method (slang.h
+	// documents them as returning exactly the same result).
+	let tag = slang::build_tag_string().expect("build tag string should be available");
+	assert!(!tag.is_empty());
+
+	let global_session = slang::GlobalSession::new().unwrap();
+	assert_eq!(Some(tag), global_session.build_tag_string());
+}
+
+#[test]
+fn load_module_from_source_blob() {
+	let session = create_test_session();
+
+	let source = slang::Blob::new(
+		b"int fortyTwo() { return 42; }\n[shader(\"compute\")][numthreads(1,1,1)] void main() {}\n",
+	);
+	let module = session
+		.load_module_from_source("blob_source", "blob_source.slang", &source)
+		.unwrap();
+	assert_eq!(module.name(), Some("blob_source"));
+	assert_eq!(module.entry_point_count(), 1);
+}
+
+#[test]
+fn global_session_add_builtins() {
+	let global_session = slang::GlobalSession::new().unwrap();
+	global_session.add_builtins(
+		"m7c_builtin.slang",
+		"public int m7cBuiltinValue() { return 42; }\n",
+	);
+
+	let target_desc = slang::TargetDesc::default().format(slang::CompileTarget::Spirv);
+	let targets = [target_desc];
+	let session_desc = slang::SessionDesc::default().targets(&targets);
+	let session = global_session.create_session(&session_desc).unwrap();
+
+	// Declarations added through `addBuiltins` are in scope for modules loaded
+	// into sessions created afterwards, without any `import`.
+	let module = session
+		.load_module_from_source_string(
+			"uses_builtin",
+			"uses_builtin.slang",
+			"int getValue() { return m7cBuiltinValue(); }\n",
+		)
+		.unwrap();
+	assert_eq!(module.name(), Some("uses_builtin"));
+}
+
+#[test]
+fn global_session_downstream_compilers() {
+	let global_session = slang::GlobalSession::new().unwrap();
+
+	// Default downstream compiler round-trip.
+	global_session
+		.set_default_downstream_compiler(slang::SourceLanguage::Hlsl, slang::PassThrough::Dxc)
+		.unwrap();
+	assert_eq!(
+		global_session.default_downstream_compiler(slang::SourceLanguage::Hlsl),
+		slang::PassThrough::Dxc
+	);
+
+	// Downstream-compiler-for-transition round-trip.
+	global_session.set_downstream_compiler_for_transition(
+		slang::CompileTarget::Hlsl,
+		slang::CompileTarget::Dxil,
+		slang::PassThrough::Dxc,
+	);
+	assert_eq!(
+		global_session.downstream_compiler_for_transition(
+			slang::CompileTarget::Hlsl,
+			slang::CompileTarget::Dxil
+		),
+		slang::PassThrough::Dxc
+	);
+
+	// Version query: the glslang family always reports (0, 0) per slang.h,
+	// and a compiler that cannot be located reports an error. Either outcome
+	// is fine here — the point is exercising the FFI path.
+	let _ = global_session.downstream_compiler_version(slang::PassThrough::Glslang);
+}
+
+#[test]
+fn builtin_module_round_trip() {
+	let global_session = slang::GlobalSession::new().unwrap();
+
+	// A fully initialized global session already has the core builtin module,
+	// so compiling it again fails, but saving it succeeds.
+	assert!(
+		global_session
+			.compile_builtin_module(slang::BuiltinModuleName::Core, 0)
+			.is_err()
+	);
+	let blob = global_session
+		.save_builtin_module(slang::BuiltinModuleName::Core, slang::ArchiveType::RiffLz4)
+		.unwrap();
+	assert!(!blob.as_slice().is_empty());
+}
+
+#[test]
+fn metadata_info_methods_empty() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let metadata = linked_program.target_metadata(0).unwrap();
+
+	// A plain shader compiled without coverage instrumentation reports zero
+	// counters/entries/resources (see coverage_synthetic_and_cooperative_metadata);
+	// the indexed accessors must reject out-of-range indices with an error
+	// rather than panic.
+	let coverage = metadata
+		.cast_as::<slang::CoverageTracingMetadata>()
+		.expect("target metadata should cast to ICoverageTracingMetadata");
+	assert_eq!(coverage.entry_count(), 0);
+	assert!(coverage.entry_info(0).is_err());
+	// Without coverage there is no synthesized buffer; `getBufferInfo` reports
+	// the not-assigned sentinels.
+	let buffer_info = coverage.buffer_info().unwrap();
+	assert_eq!(buffer_info.space, -1);
+	assert_eq!(buffer_info.binding, -1);
+
+	let synthetic = metadata
+		.cast_as::<slang::SyntheticResourceMetadata>()
+		.expect("target metadata should cast to ISyntheticResourceMetadata");
+	assert_eq!(synthetic.resource_count(), 0);
+	assert!(synthetic.resource_info(0).is_err());
+	// Id 0 is the reserved "unassigned" sentinel and never resolves.
+	assert!(synthetic.find_resource_index_by_id(0).is_err());
+
+	let cooperative = metadata
+		.cast_as::<slang::CooperativeTypesMetadata>()
+		.expect("target metadata should cast to ICooperativeTypesMetadata");
+	assert!(cooperative.cooperative_matrix_type_by_index(0).is_err());
+	assert!(
+		cooperative
+			.cooperative_matrix_combination_by_index(0)
+			.is_err()
+	);
+	assert!(cooperative.cooperative_vector_type_by_index(0).is_err());
+	assert!(
+		cooperative
+			.cooperative_vector_combination_by_index(0)
+			.is_err()
+	);
+}
+
+#[test]
+fn module_precompile_service() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+
+	// Module COM objects implement IModulePrecompileService_Experimental in
+	// Slang v2026.14.1 (slang-linkable.h).
+	let service = module
+		.precompile_service()
+		.expect("module should implement IModulePrecompileService_Experimental");
+
+	// test.slang imports nothing, so it has no module dependencies.
+	assert_eq!(service.module_dependency_count(), 0);
+	assert!(service.module_dependency(0).is_err());
+
+	service
+		.precompile_for_target(slang::CompileTarget::Spirv)
+		.unwrap();
+	let code = service
+		.precompiled_target_code(slang::CompileTarget::Spirv)
+		.unwrap();
+	assert!(!code.as_slice().is_empty());
+}
+
+#[test]
+fn byte_code_runner() {
+	// Smoke: creating a runner and querying it without a loaded module must
+	// not crash. There is no public way to produce a Slang bytecode module in
+	// v2026.14.1, so `loadModule`/`execute` stay untested.
+	let runner = slang::ByteCodeRunner::new().unwrap();
+	assert_eq!(runner.find_function_by_name("main"), -1);
+	let _ = runner.error_string();
+}
