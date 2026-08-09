@@ -27,6 +27,11 @@ pub const SLANG_E_INVALID_ARG: SlangResult = 0x80070057u32 as i32;
 /// `SLANG_E_NOT_FOUND` from slang.h (`SLANG_MAKE_CORE_ERROR(5)`).
 pub const SLANG_E_NOT_FOUND: SlangResult = 0x82000005u32 as i32;
 
+/// `SLANG_E_NOT_IMPLEMENTED` from slang.h
+/// (`SLANG_MAKE_WIN_GENERAL_ERROR(0x4001)`, HRESULT `E_NOTIMPL`); not
+/// emitted by bindgen for the same reason as `SLANG_FAIL`.
+pub const SLANG_E_NOT_IMPLEMENTED: SlangResult = 0x80004001u32 as i32;
+
 #[repr(C)]
 pub struct ICastableVtable {
 	pub _base: ISlangUnknown__bindgen_vtable,
@@ -47,6 +52,46 @@ pub struct ISlangFileSystemVtable {
 	pub _base: ICastableVtable,
 
 	pub loadFile: unsafe extern "C" fn(*mut c_void, path: *const c_char, outBlob: *mut *mut ISlangBlob) -> SlangResult,
+}
+
+#[repr(C)]
+pub struct ISlangFileSystemExtVtable {
+	pub _base: ISlangFileSystemVtable,
+
+	pub getFileUniqueIdentity: unsafe extern "C" fn(*mut c_void, path: *const c_char, outUniqueIdentity: *mut *mut ISlangBlob) -> SlangResult,
+	pub calcCombinedPath: unsafe extern "C" fn(*mut c_void, fromPathType: SlangPathType, fromPath: *const c_char, path: *const c_char, pathOut: *mut *mut ISlangBlob) -> SlangResult,
+	pub getPathType: unsafe extern "C" fn(*mut c_void, path: *const c_char, pathTypeOut: *mut SlangPathType) -> SlangResult,
+	pub getPath: unsafe extern "C" fn(*mut c_void, kind: PathKind, path: *const c_char, outPath: *mut *mut ISlangBlob) -> SlangResult,
+	pub clearCache: unsafe extern "C" fn(*mut c_void),
+	pub enumeratePathContents: unsafe extern "C" fn(*mut c_void, path: *const c_char, callback: FileSystemContentsCallBack, userData: *mut c_void) -> SlangResult,
+	pub getOSPathKind: unsafe extern "C" fn(*mut c_void) -> OSPathKind,
+}
+
+#[repr(C)]
+pub struct ISlangMutableFileSystemVtable {
+	pub _base: ISlangFileSystemExtVtable,
+
+	pub saveFile: unsafe extern "C" fn(*mut c_void, path: *const c_char, data: *const c_void, size: usize) -> SlangResult,
+	pub saveFileBlob: unsafe extern "C" fn(*mut c_void, path: *const c_char, dataBlob: *mut ISlangBlob) -> SlangResult,
+	pub remove: unsafe extern "C" fn(*mut c_void, path: *const c_char) -> SlangResult,
+	pub createDirectory: unsafe extern "C" fn(*mut c_void, path: *const c_char) -> SlangResult,
+}
+
+// Note: `ISlangSharedLibrary` also exposes the `findFuncByName` convenience
+// wrapper in slang.h, but that one is `SLANG_FORCE_INLINE` (not virtual), so
+// the vtable holds `findSymbolAddressByName` only.
+#[repr(C)]
+pub struct ISlangSharedLibraryVtable {
+	pub _base: ICastableVtable,
+
+	pub findSymbolAddressByName: unsafe extern "C" fn(*mut c_void, name: *const c_char) -> *mut c_void,
+}
+
+#[repr(C)]
+pub struct ISlangSharedLibraryLoaderVtable {
+	pub _base: ISlangUnknown__bindgen_vtable,
+
+	pub loadSharedLibrary: unsafe extern "C" fn(*mut c_void, path: *const c_char, sharedLibraryOut: *mut *mut ISlangSharedLibrary) -> SlangResult,
 }
 
 #[repr(C)]
@@ -254,6 +299,10 @@ pub(crate) const ISLANG_UNKNOWN_METHODS: usize = 3;
 pub(crate) const ISLANG_CASTABLE_METHODS: usize = 1;
 pub(crate) const ISLANG_BLOB_METHODS: usize = 2;
 pub(crate) const ISLANG_FILE_SYSTEM_METHODS: usize = 1;
+pub(crate) const ISLANG_FILE_SYSTEM_EXT_METHODS: usize = 7;
+pub(crate) const ISLANG_MUTABLE_FILE_SYSTEM_METHODS: usize = 4;
+pub(crate) const ISLANG_SHARED_LIBRARY_METHODS: usize = 1;
+pub(crate) const ISLANG_SHARED_LIBRARY_LOADER_METHODS: usize = 1;
 pub(crate) const IGLOBAL_SESSION_METHODS: usize = 30;
 pub(crate) const ISESSION_METHODS: usize = 21;
 pub(crate) const IMETADATA_METHODS: usize = 2;
@@ -290,6 +339,30 @@ const _: () = assert!(
         == std::mem::size_of::<ICastableVtable>()
             + ISLANG_FILE_SYSTEM_METHODS * std::mem::size_of::<*const c_void>(),
     "ISlangFileSystemVtable does not match ISlangCastable + 1 method (slang.h)"
+);
+const _: () = assert!(
+    std::mem::size_of::<ISlangFileSystemExtVtable>()
+        == std::mem::size_of::<ISlangFileSystemVtable>()
+            + ISLANG_FILE_SYSTEM_EXT_METHODS * std::mem::size_of::<*const c_void>(),
+    "ISlangFileSystemExtVtable does not match ISlangFileSystem + 7 methods (slang.h)"
+);
+const _: () = assert!(
+    std::mem::size_of::<ISlangMutableFileSystemVtable>()
+        == std::mem::size_of::<ISlangFileSystemExtVtable>()
+            + ISLANG_MUTABLE_FILE_SYSTEM_METHODS * std::mem::size_of::<*const c_void>(),
+    "ISlangMutableFileSystemVtable does not match ISlangFileSystemExt + 4 methods (slang.h)"
+);
+const _: () = assert!(
+    std::mem::size_of::<ISlangSharedLibraryVtable>()
+        == std::mem::size_of::<ICastableVtable>()
+            + ISLANG_SHARED_LIBRARY_METHODS * std::mem::size_of::<*const c_void>(),
+    "ISlangSharedLibraryVtable does not match ISlangCastable + 1 method (slang.h)"
+);
+const _: () = assert!(
+    std::mem::size_of::<ISlangSharedLibraryLoaderVtable>()
+        == std::mem::size_of::<ISlangUnknown__bindgen_vtable>()
+            + ISLANG_SHARED_LIBRARY_LOADER_METHODS * std::mem::size_of::<*const c_void>(),
+    "ISlangSharedLibraryLoaderVtable does not match ISlangUnknown + 1 method (slang.h)"
 );
 const _: () = assert!(
     std::mem::size_of::<IGlobalSessionVtable>()
@@ -492,6 +565,16 @@ mod tests {
             ("ISlangCastable", ISLANG_CASTABLE_METHODS),
             ("ISlangBlob", ISLANG_BLOB_METHODS),
             ("ISlangFileSystem", ISLANG_FILE_SYSTEM_METHODS),
+            ("ISlangFileSystemExt", ISLANG_FILE_SYSTEM_EXT_METHODS),
+            (
+                "ISlangMutableFileSystem",
+                ISLANG_MUTABLE_FILE_SYSTEM_METHODS,
+            ),
+            ("ISlangSharedLibrary", ISLANG_SHARED_LIBRARY_METHODS),
+            (
+                "ISlangSharedLibraryLoader",
+                ISLANG_SHARED_LIBRARY_LOADER_METHODS,
+            ),
             ("IGlobalSession", IGLOBAL_SESSION_METHODS),
             ("ISession", ISESSION_METHODS),
             ("IMetadata", IMETADATA_METHODS),

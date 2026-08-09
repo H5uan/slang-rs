@@ -87,6 +87,11 @@ fn main() {
 		.allowlist_function("spComputeStringHash")
 		.allowlist_function("slang_.*")
 		.allowlist_type("slang.*")
+		// Types referenced by the handwritten ISlangFileSystemExt /
+		// ISlangMutableFileSystem vtables in src/lib.rs.
+		.allowlist_type("SlangPathType.*")
+		.allowlist_type(".*PathKind")
+		.allowlist_type("FileSystemContentsCallBack")
 		.allowlist_var("SLANG_.*")
 		.with_codegen_config(
 			bindgen::CodegenConfig::FUNCTIONS

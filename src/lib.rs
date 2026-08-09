@@ -4,9 +4,9 @@
 //!
 //! Slang exposes a COM-style API (`slang.h`); this crate wraps it in safe,
 //! reference-counted RAII types ([`GlobalSession`], [`Session`], [`Module`],
-//! [`ComponentType`], [`EntryPoint`], [`Blob`]) plus a zero-cost
-//! [`reflection`] module for inspecting compiled shaders. All wrapper types
-//! own a COM reference and release it on drop.
+//! [`ComponentType`], [`EntryPoint`], [`Blob`], [`SharedLibrary`]) plus a
+//! zero-cost [`reflection`] module for inspecting compiled shaders. All
+//! wrapper types own a COM reference and release it on drop.
 //!
 //! # Quick start
 //!
@@ -51,29 +51,33 @@
 pub mod reflection;
 
 mod file_system;
-pub use file_system::{FileSystem, FileSystemError, FileSystemObject};
+pub use file_system::{
+	FileSystem, FileSystemError, FileSystemExt, FileSystemObject, WritableFileSystem,
+};
 
 #[cfg(test)]
 mod tests;
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::marker::PhantomData;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{null, null_mut};
 
 pub(crate) use shader_slang_rs_sys as sys;
 
 pub use sys::{
-	SlangArchiveType as ArchiveType, SlangBindingType as BindingType,
+	OSPathKind, PathKind, SlangArchiveType as ArchiveType, SlangBindingType as BindingType,
 	SlangCompileTarget as CompileTarget, SlangDebugInfoLevel as DebugInfoLevel,
 	SlangDeclKind as DeclKind, SlangFloatingPointMode as FloatingPointMode,
 	SlangImageFormat as ImageFormat, SlangLayoutRules as LayoutRules,
 	SlangLineDirectiveMode as LineDirectiveMode, SlangMatrixLayoutMode as MatrixLayoutMode,
 	SlangModifierID as ModifierID, SlangOptimizationLevel as OptimizationLevel,
 	SlangParameterCategory as ParameterCategory, SlangPassThrough as PassThrough,
-	SlangReflectionGenericArg as GenericArg, SlangReflectionGenericArgType as GenericArgType,
-	SlangResourceAccess as ResourceAccess, SlangResourceShape as ResourceShape,
-	SlangScalarType as ScalarType, SlangSourceLanguage as SourceLanguage, SlangStage as Stage,
-	SlangTargetFlags as TargetFlags, SlangTypeKind as TypeKind, SlangUUID as UUID,
+	SlangPathType as PathType, SlangReflectionGenericArg as GenericArg,
+	SlangReflectionGenericArgType as GenericArgType, SlangResourceAccess as ResourceAccess,
+	SlangResourceShape as ResourceShape, SlangScalarType as ScalarType,
+	SlangSourceLanguage as SourceLanguage, SlangStage as Stage, SlangTargetFlags as TargetFlags,
+	SlangTypeKind as TypeKind, SlangUUID as UUID,
 	slang_CompileCoreModuleFlag_Enum as CompileCoreModuleFlag,
 	slang_CompileCoreModuleFlags as CompileCoreModuleFlags,
 	slang_CompilerOptionName as CompilerOptionName, slang_ContainerType as ContainerType,
@@ -86,6 +90,13 @@ macro_rules! vcall {
 		// pointer whose layout is guaranteed by the `Interface` safety
 		// contract; argument validity is the call site's responsibility.
 		unsafe { ($self.vtable().$method)($self.as_raw(), $($args),*) }
+	};
+	($self:expr, $($base:ident).+, $method:ident($($args:expr),*)) => {
+		// SAFETY: the call goes through the COM vtable of a live interface
+		// pointer whose layout is guaranteed by the `Interface` safety
+		// contract; the method lives on a base interface reached through the
+		// `_base` chain. Argument validity is the call site's responsibility.
+		unsafe { ($self.vtable()$(.$base)+.$method)($self.as_raw(), $($args),*) }
 	};
 }
 
@@ -338,6 +349,265 @@ impl Blob {
 	/// `Err(Utf8Error)` when the contents are not valid UTF-8.
 	pub fn as_str(&self) -> std::result::Result<&str, std::str::Utf8Error> {
 		std::str::from_utf8(self.as_slice())
+	}
+}
+
+/// An owned reference to a Slang shared library (`ISlangSharedLibrary` in
+/// slang.h): an interface to executable code, produced by compiling with a
+/// CPU target such as [`CompileTarget::ShaderHostCallable`]. Obtained from
+/// [`ComponentType::entry_point_host_callable`] or
+/// [`ComponentType2::target_host_callable`]; the compiled code stays valid
+/// for as long as this object is alive.
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct SharedLibrary(IUnknown);
+
+unsafe impl Interface for SharedLibrary {
+	type Vtable = sys::ISlangSharedLibraryVtable;
+	const IID: UUID = uuid(0x70db_c7c4_dc3b_4a07_ae7e_752a_f6a8_1555);
+}
+
+impl SharedLibrary {
+	/// Finds the address of a symbol (a function or variable) exported by the
+	/// compiled code (`ISlangSharedLibrary::findSymbolAddressByName`; slang.h
+	/// also offers the `findFuncByName` convenience wrapper, which is an
+	/// inline cast of this method). Returns `None` when no symbol with `name`
+	/// exists. The returned pointer is valid for as long as this
+	/// `SharedLibrary` is alive; interpreting it (e.g. casting to a function
+	/// pointer with the correct ABI) is up to the caller.
+	pub fn find_symbol(&self, name: &str) -> Option<*mut std::ffi::c_void> {
+		let name = CString::new(name).unwrap();
+		let symbol = vcall!(self, findSymbolAddressByName(name.as_ptr()));
+		(!symbol.is_null()).then_some(symbol)
+	}
+}
+
+/// An owned reference to a Slang mutable file system
+/// (`ISlangMutableFileSystem` in slang.h): a (real or virtual) file system
+/// with path management (`ISlangFileSystemExt`) and write operations.
+/// Obtained from [`ComponentType::get_result_as_file_system`], which exposes
+/// the compilation outputs as files in an in-memory file system.
+///
+/// All paths are UTF-8 strings; path-valued results are returned as [`Blob`]s
+/// holding the zero-terminated string, as slang.h specifies.
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct MutableFileSystem(IUnknown);
+
+unsafe impl Interface for MutableFileSystem {
+	type Vtable = sys::ISlangMutableFileSystemVtable;
+	// `ISlangMutableFileSystem` IID from slang.h:
+	// A058675C-1D65-452A-8458-CCDED1427105 (note the final byte is 0x05).
+	const IID: UUID = uuid(0xa058_675c_1d65_452a_8458_ccde_d142_7105);
+}
+
+impl MutableFileSystem {
+	/// Loads the file at `path` and returns its exact bytes
+	/// (`ISlangFileSystem::loadFile`).
+	pub fn load_file(&self, path: &str) -> Result<Blob> {
+		let path = CString::new(path).unwrap();
+		let mut blob = null_mut();
+		let result = vcall!(self, _base._base, loadFile(path.as_ptr(), &mut blob));
+		// `loadFile` takes no diagnostics out-pointer; the result code is the
+		// only error signal.
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(Blob(IUnknown(
+			std::ptr::NonNull::new(blob as *mut _).unwrap(),
+		)))
+	}
+
+	/// Returns a string that uniquely identifies the object at `path`
+	/// (`ISlangFileSystemExt::getFileUniqueIdentity`). Two paths may only
+	/// report the same identity when their contents are identical; Slang uses
+	/// the identity for source caching and `#pragma once`.
+	pub fn file_unique_identity(&self, path: &str) -> Result<Blob> {
+		let path = CString::new(path).unwrap();
+		let mut identity = null_mut();
+		let result = vcall!(
+			self,
+			_base,
+			getFileUniqueIdentity(path.as_ptr(), &mut identity)
+		);
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(Blob(IUnknown(
+			std::ptr::NonNull::new(identity as *mut _).unwrap(),
+		)))
+	}
+
+	/// Combines `from_path` with `path` into a single path
+	/// (`ISlangFileSystemExt::calcCombinedPath`). `from_path_type` tells the
+	/// file system whether to interpret `from_path` as a file (combine
+	/// relative to its directory) or as a directory.
+	pub fn calc_combined_path(
+		&self,
+		from_path_type: PathType,
+		from_path: &str,
+		path: &str,
+	) -> Result<Blob> {
+		let from_path = CString::new(from_path).unwrap();
+		let path = CString::new(path).unwrap();
+		let mut combined = null_mut();
+		let result = vcall!(
+			self,
+			_base,
+			calcCombinedPath(
+				from_path_type,
+				from_path.as_ptr(),
+				path.as_ptr(),
+				&mut combined
+			)
+		);
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(Blob(IUnknown(
+			std::ptr::NonNull::new(combined as *mut _).unwrap(),
+		)))
+	}
+
+	/// Returns whether `path` names a file or a directory
+	/// (`ISlangFileSystemExt::getPathType`). Returns `Err` when the path does
+	/// not exist on this file system.
+	pub fn path_type(&self, path: &str) -> Result<PathType> {
+		let path = CString::new(path).unwrap();
+		let mut path_type = PathType::File;
+		let result = vcall!(self, _base, getPathType(path.as_ptr(), &mut path_type));
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(path_type)
+	}
+
+	/// Returns `path` converted to the requested `kind`
+	/// (`ISlangFileSystemExt::getPath`), e.g. simplified or canonicalized.
+	/// Returns `Err` when the file system does not support the conversion.
+	pub fn get_path(&self, kind: PathKind, path: &str) -> Result<Blob> {
+		let path = CString::new(path).unwrap();
+		let mut out_path = null_mut();
+		let result = vcall!(self, _base, getPath(kind, path.as_ptr(), &mut out_path));
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(Blob(IUnknown(
+			std::ptr::NonNull::new(out_path as *mut _).unwrap(),
+		)))
+	}
+
+	/// Clears any cached path information the file system holds
+	/// (`ISlangFileSystemExt::clearCache`).
+	pub fn clear_cache(&self) {
+		vcall!(self, _base, clearCache());
+	}
+
+	/// Enumerates the entries of the directory at `path`
+	/// (`ISlangFileSystemExt::enumeratePathContents`), invoking `callback`
+	/// with the type and bare name of each entry. Returns `Err` when the file
+	/// system does not support enumeration.
+	///
+	/// A panic inside `callback` never unwinds across the FFI boundary into
+	/// C++: it is caught at the callback trampoline (the panic message still
+	/// reaches the default panic hook) and enumeration continues with the
+	/// next entry.
+	pub fn enumerate_path_contents(
+		&self,
+		path: &str,
+		callback: impl FnMut(PathType, &str),
+	) -> Result<()> {
+		let path = CString::new(path).unwrap();
+		let mut callback = callback;
+		let mut callback: &mut dyn FnMut(PathType, &str) = &mut callback;
+
+		unsafe extern "C" fn forward(
+			path_type: sys::SlangPathType,
+			name: *const c_char,
+			user_data: *mut c_void,
+		) {
+			// SAFETY: `user_data` is the `&mut dyn FnMut(PathType, &str)`
+			// passed to `enumeratePathContents` below together with this
+			// trampoline, valid for the duration of the call.
+			let callback = unsafe { &mut *(user_data as *mut &mut dyn FnMut(PathType, &str)) };
+			// SAFETY: a non-null `name` from Slang is a NUL-terminated string
+			// valid for the duration of the callback.
+			let name = unsafe { str_from_slang(name) };
+			if let Some(name) = name {
+				// A panic in the caller's closure must not unwind into C++.
+				let _ = catch_unwind(AssertUnwindSafe(|| callback(path_type, name)));
+			}
+		}
+
+		let result = vcall!(
+			self,
+			_base,
+			enumeratePathContents(
+				path.as_ptr(),
+				Some(forward),
+				&mut callback as *mut _ as *mut c_void
+			)
+		);
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(())
+	}
+
+	/// Returns how paths used with this file system map to the operating
+	/// system's file system (`ISlangFileSystemExt::getOSPathKind`).
+	pub fn os_path_kind(&self) -> OSPathKind {
+		vcall!(self, _base, getOSPathKind())
+	}
+
+	/// Writes `data` to `path` (`ISlangMutableFileSystem::saveFile`),
+	/// replacing any existing file.
+	pub fn save_file(&self, path: &str, data: &[u8]) -> Result<()> {
+		let path = CString::new(path).unwrap();
+		let result = vcall!(
+			self,
+			saveFile(path.as_ptr(), data.as_ptr() as *const c_void, data.len())
+		);
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(())
+	}
+
+	/// Writes the contents of `data` to `path`
+	/// (`ISlangMutableFileSystem::saveFileBlob`). Depending on the
+	/// implementation this can be cheaper than [`MutableFileSystem::save_file`];
+	/// the blob is treated as immutable.
+	pub fn save_file_blob(&self, path: &str, data: &Blob) -> Result<()> {
+		let path = CString::new(path).unwrap();
+		let result = vcall!(self, saveFileBlob(path.as_ptr(), data.as_raw()));
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(())
+	}
+
+	/// Removes the file or empty directory at `path`
+	/// (`ISlangMutableFileSystem::remove`).
+	pub fn remove(&self, path: &str) -> Result<()> {
+		let path = CString::new(path).unwrap();
+		let result = vcall!(self, remove(path.as_ptr()));
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(())
+	}
+
+	/// Creates the directory at `path`
+	/// (`ISlangMutableFileSystem::createDirectory`). The parent path must
+	/// exist.
+	pub fn create_directory(&self, path: &str) -> Result<()> {
+		let path = CString::new(path).unwrap();
+		let result = vcall!(self, createDirectory(path.as_ptr()));
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(())
 	}
 }
 
@@ -1342,7 +1612,7 @@ impl CompileResult {
 }
 
 /// Extension interface of [`ComponentType`] for getting separate debug data
-/// (`IComponentType2` in slang.h). Obtain it with
+/// and host-callable code (`IComponentType2` in slang.h). Obtain it with
 /// [`ComponentType::as_component_type2`].
 ///
 /// Note: `IComponentType2` inherits `ISlangUnknown` directly in slang.h, not
@@ -1402,6 +1672,32 @@ impl ComponentType2 {
 
 		Ok(CompileResult(IUnknown(
 			std::ptr::NonNull::new(compile_result as *mut _).unwrap(),
+		)))
+	}
+
+	/// Compiles all entry points for the chosen `target_index` into
+	/// host-machine code and returns them as a [`SharedLibrary`] whose
+	/// exported symbols can be called directly from the application
+	/// (`IComponentType2::getTargetHostCallable`). Like
+	/// [`ComponentType::entry_point_host_callable`], but covers the whole
+	/// target rather than a single entry point.
+	///
+	/// Returns `Err` when compilation fails; the error carries the diagnostics
+	/// blob when Slang produced one.
+	pub fn target_host_callable(&self, target_index: i32) -> Result<SharedLibrary> {
+		let mut shared_library = null_mut();
+		let mut diagnostics = null_mut();
+
+		result_from_blob(
+			vcall!(
+				self,
+				getTargetHostCallable(target_index, &mut shared_library, &mut diagnostics)
+			),
+			diagnostics,
+		)?;
+
+		Ok(SharedLibrary(IUnknown(
+			std::ptr::NonNull::new(shared_library as *mut _).unwrap(),
 		)))
 	}
 }
@@ -1700,6 +1996,29 @@ impl ComponentType {
 		)))
 	}
 
+	/// Gets the compilation result for the entry point at `index` for the
+	/// chosen `target` as an in-memory [`MutableFileSystem`]
+	/// (`IComponentType::getResultAsFileSystem`). The compiled code plus any
+	/// associated artifacts (diagnostics, source maps, ...) are exposed as
+	/// files in the returned file system instead of being written to disk.
+	/// Has the same requirements as [`ComponentType::entry_point_code`].
+	///
+	/// Returns `Err` when code generation fails; `getResultAsFileSystem`
+	/// takes no diagnostics out-pointer, so the error carries only the result
+	/// code (any diagnostics are available as a file inside the file system).
+	pub fn get_result_as_file_system(&self, index: i64, target: i64) -> Result<MutableFileSystem> {
+		let mut file_system = null_mut();
+
+		let result = vcall!(self, getResultAsFileSystem(index, target, &mut file_system));
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+
+		Ok(MutableFileSystem(IUnknown(
+			std::ptr::NonNull::new(file_system as *mut _).unwrap(),
+		)))
+	}
+
 	/// Gets metadata for the chosen `target_index`
 	/// (`IComponentType::getTargetMetadata`). Has the same requirements as
 	/// [`ComponentType::entry_point_code`].
@@ -1752,6 +2071,44 @@ impl ComponentType {
 
 		Ok(Metadata(IUnknown(
 			std::ptr::NonNull::new(metadata as *mut _).unwrap(),
+		)))
+	}
+
+	/// Compiles the entry point at `entry_point_index` for the chosen
+	/// `target_index` into host-machine code and returns it as a
+	/// [`SharedLibrary`] whose exported symbols can be called directly from
+	/// the application (`IComponentType::getEntryPointHostCallable`). Requires
+	/// a compilation target with a host-callable format (e.g.
+	/// [`CompileTarget::ShaderHostCallable`]) and a downstream CPU compiler —
+	/// see the "Host callable" section of Slang's `docs/cpu-target.md` for the
+	/// ABI of the exported functions. The indices are plain `int` in slang.h
+	/// (not `SlangInt`), hence `i32` here.
+	///
+	/// Returns `Err` when compilation fails; the error carries the diagnostics
+	/// blob when Slang produced one.
+	pub fn entry_point_host_callable(
+		&self,
+		entry_point_index: i32,
+		target_index: i32,
+	) -> Result<SharedLibrary> {
+		let mut shared_library = null_mut();
+		let mut diagnostics = null_mut();
+
+		result_from_blob(
+			vcall!(
+				self,
+				getEntryPointHostCallable(
+					entry_point_index,
+					target_index,
+					&mut shared_library,
+					&mut diagnostics
+				)
+			),
+			diagnostics,
+		)?;
+
+		Ok(SharedLibrary(IUnknown(
+			std::ptr::NonNull::new(shared_library as *mut _).unwrap(),
 		)))
 	}
 

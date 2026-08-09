@@ -1258,3 +1258,458 @@ fn file_system_query_interface() {
 			.is_some()
 	);
 }
+
+// --- FileSystemExt / WritableFileSystem (reverse COM) tests ---
+
+/// A [`slang::FileSystemExt`] implementation over an in-memory file set,
+/// counting Ext callbacks so the tests can prove Slang used the
+/// implementation's path management directly instead of wrapping the object
+/// in its `CacheFileSystem` emulation.
+struct VirtualFileSystemExt {
+	files: std::collections::HashMap<String, Vec<u8>>,
+	ext_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl VirtualFileSystemExt {
+	fn new(files: &[(&str, &str)]) -> Self {
+		Self {
+			files: files
+				.iter()
+				.map(|(path, source)| (path.to_string(), source.as_bytes().to_vec()))
+				.collect(),
+			ext_calls: Default::default(),
+		}
+	}
+
+	/// The bare file name of `path` (the virtual file set is flat).
+	fn file_name(path: &str) -> &str {
+		path.rsplit(['/', '\\']).next().unwrap_or(path)
+	}
+
+	/// Naive path combining, sufficient for the flat virtual file set:
+	/// resolves `path` relative to the directory of `from_path`.
+	fn combine(from_path_type: slang::PathType, from_path: &str, path: &str) -> String {
+		let directory = match from_path_type {
+			slang::PathType::Directory => from_path,
+			slang::PathType::File => from_path
+				.rfind(['/', '\\'])
+				.map(|index| &from_path[..index])
+				.unwrap_or(""),
+		};
+		if directory.is_empty() {
+			path.to_string()
+		} else {
+			format!("{directory}/{path}")
+		}
+	}
+}
+
+impl slang::FileSystem for VirtualFileSystemExt {
+	fn load_file(&self, path: &str) -> Result<Vec<u8>, slang::FileSystemError> {
+		self.files
+			.get(Self::file_name(path))
+			.cloned()
+			.ok_or(slang::FileSystemError::NotFound)
+	}
+}
+
+impl slang::FileSystemExt for VirtualFileSystemExt {
+	fn file_unique_identity(&self, path: &str) -> Result<String, slang::FileSystemError> {
+		self.ext_calls
+			.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		Ok(path.to_string())
+	}
+
+	fn calc_combined_path(
+		&self,
+		from_path_type: slang::PathType,
+		from_path: &str,
+		path: &str,
+	) -> Result<String, slang::FileSystemError> {
+		self.ext_calls
+			.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		Ok(Self::combine(from_path_type, from_path, path))
+	}
+
+	fn path_type(&self, path: &str) -> Result<slang::PathType, slang::FileSystemError> {
+		self.ext_calls
+			.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		let name = Self::file_name(path);
+		if self.files.contains_key(name) {
+			Ok(slang::PathType::File)
+		} else if path.is_empty() || !name.contains('.') {
+			// Treat anything that does not look like a file (search paths,
+			// ".", ...) as an existing directory.
+			Ok(slang::PathType::Directory)
+		} else {
+			Err(slang::FileSystemError::NotFound)
+		}
+	}
+
+	fn get_path(
+		&self,
+		_kind: slang::PathKind,
+		path: &str,
+	) -> Result<String, slang::FileSystemError> {
+		// The identity transformation is a valid simplified path.
+		Ok(path.to_string())
+	}
+}
+
+/// A module that only exists in the virtual file system must compile end to
+/// end with the Ext path management, and Slang must have called it directly:
+/// with the `CacheFileSystem` wrapper (used for plain [`slang::FileSystem`]
+/// objects) none of the Ext callbacks would fire.
+#[test]
+fn file_system_ext_path_management() {
+	use std::sync::atomic::Ordering;
+
+	let fs = VirtualFileSystemExt::new(&[("ext_test.slang", VIRTUAL_SHADER)]);
+	let ext_calls = fs.ext_calls.clone();
+	let fs = slang::FileSystemObject::new_ext(fs);
+	let session = create_fs_session(&fs);
+
+	let module = session.load_module("ext_test").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let code = linked_program.entry_point_code(0, 0).unwrap();
+	assert!(!code.as_slice().is_empty());
+
+	assert!(
+		ext_calls.load(Ordering::SeqCst) > 0,
+		"Slang should have used the Ext path management directly (no CacheFileSystem wrapper)"
+	);
+}
+
+/// An in-memory [`slang::WritableFileSystem`] with file and directory
+/// tracking, used to drive the reverse thunks through the forward
+/// [`slang::MutableFileSystem`] wrapper.
+#[derive(Default)]
+struct VirtualWritableFileSystem {
+	files: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+	directories: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl slang::FileSystem for VirtualWritableFileSystem {
+	fn load_file(&self, path: &str) -> Result<Vec<u8>, slang::FileSystemError> {
+		self.files
+			.lock()
+			.unwrap()
+			.get(path)
+			.cloned()
+			.ok_or(slang::FileSystemError::NotFound)
+	}
+}
+
+impl slang::FileSystemExt for VirtualWritableFileSystem {
+	fn file_unique_identity(&self, path: &str) -> Result<String, slang::FileSystemError> {
+		Ok(path.to_string())
+	}
+
+	fn calc_combined_path(
+		&self,
+		from_path_type: slang::PathType,
+		from_path: &str,
+		path: &str,
+	) -> Result<String, slang::FileSystemError> {
+		Ok(VirtualFileSystemExt::combine(
+			from_path_type,
+			from_path,
+			path,
+		))
+	}
+
+	fn path_type(&self, path: &str) -> Result<slang::PathType, slang::FileSystemError> {
+		if self.files.lock().unwrap().contains_key(path) {
+			Ok(slang::PathType::File)
+		} else if self.directories.lock().unwrap().contains(path) {
+			Ok(slang::PathType::Directory)
+		} else {
+			Err(slang::FileSystemError::NotFound)
+		}
+	}
+}
+
+impl slang::WritableFileSystem for VirtualWritableFileSystem {
+	fn save_file(&self, path: &str, data: &[u8]) -> Result<(), slang::FileSystemError> {
+		self.files
+			.lock()
+			.unwrap()
+			.insert(path.to_string(), data.to_vec());
+		Ok(())
+	}
+
+	fn remove(&self, path: &str) -> Result<(), slang::FileSystemError> {
+		let removed = self.files.lock().unwrap().remove(path).is_some()
+			|| self.directories.lock().unwrap().remove(path);
+		if removed {
+			Ok(())
+		} else {
+			Err(slang::FileSystemError::NotFound)
+		}
+	}
+
+	fn create_directory(&self, path: &str) -> Result<(), slang::FileSystemError> {
+		self.directories.lock().unwrap().insert(path.to_string());
+		Ok(())
+	}
+}
+
+/// `queryInterface` answers exactly the interface level the object was
+/// created with.
+#[test]
+fn file_system_interface_levels() {
+	use slang::Interface;
+
+	let base = slang::FileSystemObject::new(VirtualFileSystem::new(&[]));
+	let ext = slang::FileSystemObject::new_ext(VirtualFileSystemExt::new(&[]));
+	let writable = slang::FileSystemObject::new_writable(VirtualWritableFileSystem::default());
+
+	// Every level answers the base `ISlangFileSystem` IID.
+	assert!(
+		ext.as_unknown()
+			.query_interface::<slang::FileSystemObject>()
+			.is_some()
+	);
+	assert!(
+		writable
+			.as_unknown()
+			.query_interface::<slang::FileSystemObject>()
+			.is_some()
+	);
+
+	// Only a writable object answers `ISlangMutableFileSystem`.
+	assert!(
+		base.as_unknown()
+			.query_interface::<slang::MutableFileSystem>()
+			.is_none()
+	);
+	assert!(
+		ext.as_unknown()
+			.query_interface::<slang::MutableFileSystem>()
+			.is_none()
+	);
+	assert!(
+		writable
+			.as_unknown()
+			.query_interface::<slang::MutableFileSystem>()
+			.is_some()
+	);
+}
+
+/// Drives a Rust `WritableFileSystem` through the forward
+/// [`slang::MutableFileSystem`] wrapper: every call crosses forward wrapper
+/// -> COM vtable -> reverse thunk -> Rust implementation.
+#[test]
+fn file_system_writable_forward_roundtrip() {
+	use slang::Interface;
+
+	let fs = slang::FileSystemObject::new_writable(VirtualWritableFileSystem::default());
+	let mutable = fs
+		.as_unknown()
+		.query_interface::<slang::MutableFileSystem>()
+		.unwrap();
+
+	mutable.create_directory("shaders").unwrap();
+	assert_eq!(
+		mutable.path_type("shaders").unwrap(),
+		slang::PathType::Directory
+	);
+
+	mutable.save_file("shaders/a.bin", b"hello").unwrap();
+	assert_eq!(
+		mutable.path_type("shaders/a.bin").unwrap(),
+		slang::PathType::File
+	);
+	assert_eq!(
+		mutable.load_file("shaders/a.bin").unwrap().as_slice(),
+		b"hello"
+	);
+
+	// Ext path resolution goes to the Rust implementation (naive join); the
+	// returned blob holds the path zero terminated, as slang.h specifies.
+	let combined = mutable
+		.calc_combined_path(slang::PathType::File, "shaders/main.slang", "child.slang")
+		.unwrap();
+	assert_eq!(combined.as_slice(), b"shaders/child.slang\0");
+
+	mutable.remove("shaders/a.bin").unwrap();
+	assert!(mutable.load_file("shaders/a.bin").is_err());
+
+	assert_eq!(mutable.os_path_kind(), slang::OSPathKind::None);
+}
+
+// --- get_result_as_file_system (forward) tests ---
+
+/// The compilation outputs are exposed as files in an in-memory
+/// `ISlangMutableFileSystem`: enumerate them, read the SPIR-V binary back,
+/// and exercise the write operations of the result file system.
+#[test]
+fn result_as_file_system() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+
+	let fs = linked_program.get_result_as_file_system(0, 0).unwrap();
+
+	// The compiled entry point shows up as a file in the result file system.
+	// (MemoryFileSystem's root directory is addressed as ".".)
+	let mut entries = Vec::new();
+	fs.enumerate_path_contents(".", |path_type, name| {
+		entries.push((path_type, name.to_string()));
+	})
+	.unwrap();
+	let spv = entries
+		.iter()
+		.find(|(path_type, name)| *path_type == slang::PathType::File && name.ends_with(".spv"))
+		.map(|(_, name)| name.clone());
+	let Some(spv) = spv else {
+		panic!("no .spv file in the result file system, got: {entries:?}")
+	};
+
+	// Its contents are the SPIR-V binary (magic number 0x07230203, little
+	// endian) that `entry_point_code` produces.
+	let from_fs = fs.load_file(&spv).unwrap();
+	let expected = linked_program.entry_point_code(0, 0).unwrap();
+	assert_eq!(&from_fs.as_slice()[..4], &[0x03, 0x02, 0x23, 0x07]);
+	assert_eq!(from_fs.as_slice(), expected.as_slice());
+
+	// The result file system is fully mutable.
+	fs.save_file("extra.bin", b"extra").unwrap();
+	assert_eq!(fs.load_file("extra.bin").unwrap().as_slice(), b"extra");
+	fs.remove("extra.bin").unwrap();
+	assert!(fs.load_file("extra.bin").is_err());
+}
+
+/// End-to-end host-callable test: a compute entry point is compiled to host
+/// machine code (`CompileTarget::ShaderHostCallable`) and called directly from
+/// Rust. The ABI of the exported function follows Slang's
+/// `docs/cpu-target.md` (and the `examples/cpu-hello-world` C++ sample):
+///
+/// - the entry point is exported under its source name with the signature
+///   `void fn(ComputeVaryingInput*, UniformEntryPointParams*, UniformState*)`;
+///   a single call executes the whole group range
+///   `[startGroupID, endGroupID)`;
+/// - `RWStructuredBuffer<T>` maps to `{ T* data; size_t count; }` and global
+///   bindings land in `UniformState` in source declaration order;
+/// - the entry point has no uniform parameters, so the second argument is
+///   null.
+#[test]
+fn host_callable() {
+	use std::ffi::c_void;
+
+	let global_session = slang::GlobalSession::new().unwrap();
+
+	// Host-callable compilation needs a downstream CPU compiler: the bundled
+	// slang-llvm JIT (preferred), or a system C/C++ compiler. Skip when none
+	// is available.
+	let has_cpu_compiler = [
+		slang::PassThrough::Llvm,
+		slang::PassThrough::VisualStudio,
+		slang::PassThrough::Gcc,
+		slang::PassThrough::Clang,
+		slang::PassThrough::GenericCCpp,
+	]
+	.into_iter()
+	.any(|compiler| global_session.check_pass_through_support(compiler).is_ok());
+	if !has_cpu_compiler {
+		eprintln!("skipping host_callable: no downstream CPU compiler available");
+		return;
+	}
+
+	let target_desc = slang::TargetDesc::default().format(slang::CompileTarget::ShaderHostCallable);
+	let targets = [target_desc];
+	let session_desc = slang::SessionDesc::default().targets(&targets);
+	let session = global_session.create_session(&session_desc).unwrap();
+
+	let source = r#"
+RWStructuredBuffer<int> inputBuffer;
+RWStructuredBuffer<int> outputBuffer;
+
+[shader("compute")]
+[numthreads(4, 1, 1)]
+void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+	uint tid = dispatchThreadID.x;
+	outputBuffer[tid] = inputBuffer[tid] * 2 + 1;
+}
+"#;
+	let module = session
+		.load_module_from_source_string("host_callable", "host_callable.slang", source)
+		.unwrap();
+	let entry_point = module.find_entry_point_by_name("computeMain").unwrap();
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+
+	let shared_library = program.entry_point_host_callable(0, 0).unwrap();
+
+	// The ABI of the exported entry point, per docs/cpu-target.md.
+	#[repr(C)]
+	struct StructuredBuffer {
+		data: *mut i32,
+		count: usize,
+	}
+
+	#[repr(C)]
+	struct UniformState {
+		input_buffer: StructuredBuffer,
+		output_buffer: StructuredBuffer,
+	}
+
+	#[repr(C)]
+	struct ComputeVaryingInput {
+		start_group_id: [u32; 3],
+		end_group_id: [u32; 3],
+	}
+
+	type ComputeFunc =
+		extern "C" fn(*const ComputeVaryingInput, *const c_void, *const UniformState);
+
+	let symbol = shared_library.find_symbol("computeMain").unwrap();
+	// SAFETY: `symbol` is the entry point function Slang compiled for the
+	// host-callable target; its signature is the documented
+	// `void fn(ComputeVaryingInput*, UniformEntryPointParams*, UniformState*)`
+	// with C calling convention. The `SharedLibrary` (which owns the code)
+	// outlives this call.
+	let func: ComputeFunc = unsafe { std::mem::transmute(symbol) };
+
+	let input = [1, 2, 3, 4];
+	let mut output = [0; 4];
+
+	let uniform_state = UniformState {
+		input_buffer: StructuredBuffer {
+			data: input.as_ptr() as *mut i32,
+			count: input.len(),
+		},
+		output_buffer: StructuredBuffer {
+			data: output.as_mut_ptr(),
+			count: output.len(),
+		},
+	};
+	let varying_input = ComputeVaryingInput {
+		start_group_id: [0, 0, 0],
+		end_group_id: [1, 1, 1],
+	};
+
+	// `[numthreads(4, 1, 1)]` with a single group covers all 4 elements. The
+	// kernel only writes through `output_buffer` and only within its `count`,
+	// so the raw pointers stay in bounds for the duration of the call.
+	func(&varying_input, std::ptr::null(), &uniform_state);
+	assert_eq!(output, [3, 5, 7, 9]);
+
+	// Unknown symbols report `None`.
+	assert!(shared_library.find_symbol("no_such_symbol").is_none());
+
+	// `IComponentType2::getTargetHostCallable` exports the same entry point.
+	let program2 = program.as_component_type2().unwrap();
+	let target_library = program2.target_host_callable(0).unwrap();
+	assert!(target_library.find_symbol("computeMain").is_some());
+}

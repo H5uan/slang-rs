@@ -9,9 +9,9 @@ shader-slang-rs 是 [Slang 着色器语言编译器](https://github.com/shader-s
 ## 仓库结构
 
 - `shader-slang-rs-sys/` — 底层 FFI crate。bindgen 仅从 `slang.h` 生成数据类型/枚举/free function;COM 接口的 vtable 在 `shader-slang-rs-sys/src/lib.rs` 中**手写**(`#[repr(C)]` 结构体,`_base` 字段表达继承)。
-- `src/` — 高层安全 API crate(shader-slang-rs):`IUnknown` 引用计数 RAII、`GlobalSession`/`Session`/`Module`/`ComponentType`/`EntryPoint`/`Blob`/`Metadata`、builder 风格 desc、`reflection/` 反射模块(零开销 borrowed 引用包装)、`file_system.rs` 反向 COM(Rust 实现 `ISlangFileSystem` 供 C++ 回调:`FileSystem` trait + `FileSystemObject` 包装,手写 vtable thunk + `catch_unwind` panic 隔离)。
+- `src/` — 高层安全 API crate(shader-slang-rs):`IUnknown` 引用计数 RAII、`GlobalSession`/`Session`/`Module`/`ComponentType`/`EntryPoint`/`Blob`/`Metadata`/`MutableFileSystem`、builder 风格 desc、`reflection/` 反射模块(零开销 borrowed 引用包装)、`file_system.rs` 反向 COM(Rust 实现 `ISlangFileSystem`/`ISlangFileSystemExt`/`ISlangMutableFileSystem` 供 C++ 回调:`FileSystem`/`FileSystemExt`/`WritableFileSystem` trait + `FileSystemObject` 包装,手写 vtable thunk + `catch_unwind` panic 隔离)。
 - `src/tests.rs` — 端到端集成测试(真编译,非 mock)。
-- `examples/` — 可运行示例:`compile`(最小编译流程)、`reflect`(反射遍历)、`virtual_file_system`(内存文件系统)。`cargo run --example <name>`。
+- `examples/` — 可运行示例:`compile`(最小编译流程)、`reflect`(反射遍历)、`virtual_file_system`(内存文件系统)、`host_callable`(编译为宿主机器码并直接调用)。`cargo run --example <name>`。
 - `shaders/test.slang` — 测试用 shader。
 - `.github/workflows/ci.yml` — CI:windows/ubuntu/macos(aarch64)三平台跑 fmt/clippy/test;不拉取 slang/ 子模块(走预编译包)。
 - `slang/` — Slang 源码 git submodule,pin 在 v2026.14.1 tag。**不要修改其内容**(包括其中的 `.claude/`、`CLAUDE.md`,那是上游仓库的文件)。
