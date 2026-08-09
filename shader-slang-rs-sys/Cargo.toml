@@ -1,9 +1,13 @@
 [package]
-name = "slang-rs-sys"
+name = "shader-slang-rs-sys"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "FFI bindings for the Slang shader language compiler"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/H5uan/slang-rs"
+readme = "README.md"
+keywords = ["slang", "shader", "ffi", "bindings", "compiler"]
 categories = ["compilers", "external-ffi-bindings"]
 links = "slang"
 

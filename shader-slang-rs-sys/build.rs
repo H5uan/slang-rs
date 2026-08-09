@@ -35,7 +35,10 @@ fn main() {
 	// The slang/ submodule (pinned to the matching release tag) is the
 	// authoritative header source; the prebuilt archive's include/ directory
 	// serves as fallback.
-	let prebuilt_include = lib_dir.parent().map(|p| p.join("include")).unwrap_or_default();
+	let prebuilt_include = lib_dir
+		.parent()
+		.map(|p| p.join("include"))
+		.unwrap_or_default();
 	let include_dir = if let Ok(dir) = env::var("SLANG_INCLUDE_DIR") {
 		PathBuf::from(dir)
 	} else if let Ok(dir) = env::var("SLANG_DIR") {
@@ -45,12 +48,32 @@ fn main() {
 	} else if prebuilt_include.join("slang.h").exists() {
 		prebuilt_include
 	} else {
-		panic!("Could not locate slang.h (checked SLANG_INCLUDE_DIR, SLANG_DIR, slang/ submodule, prebuilt archive)");
+		panic!(
+			"Could not locate slang.h (checked SLANG_INCLUDE_DIR, SLANG_DIR, slang/ submodule, prebuilt archive)"
+		);
 	};
+
+	println!(
+		"cargo:rerun-if-changed={}",
+		include_dir.join("slang.h").display()
+	);
+	// Export the header location so the vtable ABI test in src/lib.rs can
+	// cross-check the handwritten vtables against the exact slang.h in use.
+	println!(
+		"cargo:rustc-env=SHADER_SLANG_RS_SYS_SLANG_INCLUDE_DIR={}",
+		include_dir.display()
+	);
 
 	println!("cargo:rustc-link-search=native={}", lib_dir.display());
 	println!("cargo:rustc-link-lib=dylib=slang");
 
+	// Runtime library lookup: on Windows the DLLs are copied next to the
+	// executables below. On Linux/macOS no copying is needed for
+	// `cargo test`/`cargo run`: Cargo extends LD_LIBRARY_PATH /
+	// DYLD_FALLBACK_LIBRARY_PATH with every `rustc-link-search` directory
+	// that lives inside target/, which the slang-bin cache satisfies.
+	// Downstream binaries running outside Cargo must arrange their own
+	// rpath / loader path (or set SLANG_DIR and handle it themselves).
 	copy_dlls_to_profile_dir(&lib_dir);
 
 	let out_dir = env::var("OUT_DIR").expect("Couldn't determine output directory.");
@@ -95,27 +118,47 @@ fn ensure_prebuilt(workspace_dir: &Path) -> PathBuf {
 		return lib_dir;
 	}
 
-	let (os, arch) = match (env::consts::OS, env::consts::ARCH) {
-		("windows", "x86_64") => ("windows", "x86_64"),
-		("windows", "aarch64") => ("windows", "aarch64"),
+	// Artifact names follow
+	// `slang-{version}-{os}-{arch}.{zip,tar.gz}` (see the v2026.14.1 release
+	// page). The plain `linux-*` archives target a current glibc baseline;
+	// upstream additionally publishes `-glibc-2.27`/`-glibc-2.28` variants
+	// for older systems, which can be pointed at manually via SLANG_DIR.
+	// The Linux and macOS branches are written against the official release
+	// artifacts but have not been verified on a local machine.
+	let (os, arch, ext) = match (env::consts::OS, env::consts::ARCH) {
+		("windows", "x86_64") => ("windows", "x86_64", "zip"),
+		("windows", "aarch64") => ("windows", "aarch64", "zip"),
+		("linux", "x86_64") => ("linux", "x86_64", "tar.gz"),
+		("linux", "aarch64") => ("linux", "aarch64", "tar.gz"),
+		("macos", "x86_64") => ("macos", "x86_64", "tar.gz"),
+		("macos", "aarch64") => ("macos", "aarch64", "tar.gz"),
 		(other_os, other_arch) => panic!(
-			"Prebuilt download is only supported on Windows; got {other_os}/{other_arch}. \
+			"No prebuilt Slang archive for {other_os}/{other_arch}. \
 			Set SLANG_DIR or use --features source-build instead."
 		),
 	};
 
 	let url = format!(
-		"https://github.com/shader-slang/slang/releases/download/v{SLANG_VERSION}/slang-{SLANG_VERSION}-{os}-{arch}.zip"
+		"https://github.com/shader-slang/slang/releases/download/v{SLANG_VERSION}/slang-{SLANG_VERSION}-{os}-{arch}.{ext}"
 	);
-	let zip_path = cache_dir.join("slang.zip");
+	let archive_path = cache_dir.join(format!("slang.{ext}"));
 
 	std::fs::create_dir_all(&cache_dir).expect("Couldn't create slang-bin cache directory.");
 
-	if !zip_path.exists() {
-		run(Command::new("curl").args(["-sL", "-f", "-o"]).arg(&zip_path).arg(&url));
+	if !archive_path.exists() {
+		run(Command::new("curl")
+			.args(["-sL", "-f", "-o"])
+			.arg(&archive_path)
+			.arg(&url));
 	}
 
-	run(Command::new("tar").arg("-xf").arg(&zip_path).arg("-C").arg(&cache_dir));
+	// bsdtar (Windows) and GNU/BSD tar (Linux/macOS) all auto-detect the
+	// zip/gzip format, so a single extraction path covers every platform.
+	run(Command::new("tar")
+		.arg("-xf")
+		.arg(&archive_path)
+		.arg("-C")
+		.arg(&cache_dir));
 
 	assert!(
 		lib_dir.join(import_lib_name()).exists(),
@@ -139,7 +182,8 @@ fn build_from_source(workspace_dir: &Path) -> PathBuf {
 	// The compiler library needs these bundled dependencies; tools and tests
 	// are disabled, so their externals (slang-rhi, imgui, ...) are skipped.
 	run(Command::new("git")
-		.arg("-C").arg(&slang_dir)
+		.arg("-C")
+		.arg(&slang_dir)
 		.args(["submodule", "update", "--init"])
 		.args([
 			"external/spirv-tools",
@@ -156,14 +200,13 @@ fn build_from_source(workspace_dir: &Path) -> PathBuf {
 		]));
 
 	if !build_dir.join("CMakeCache.txt").exists() {
-		run(Command::new("cmake")
-			.arg("-S").arg(&slang_dir)
-			.arg("-B").arg(&build_dir)
+		let mut configure = Command::new("cmake");
+		configure
+			.arg("-S")
+			.arg(&slang_dir)
+			.arg("-B")
+			.arg(&build_dir)
 			.arg("-DCMAKE_BUILD_TYPE=Release")
-			// Avoid C4819 (code page) warnings being escalated to errors on
-			// non-UTF-8 locales.
-			.arg("-DCMAKE_C_FLAGS=/utf-8")
-			.arg("-DCMAKE_CXX_FLAGS=/utf-8")
 			// Only the compiler library is needed; skip tools, tests and
 			// optional dependencies to keep the build small.
 			.arg("-DSLANG_SLANG_LLVM_FLAVOR=DISABLE")
@@ -174,22 +217,36 @@ fn build_from_source(workspace_dir: &Path) -> PathBuf {
 			.arg("-DSLANG_ENABLE_SLANGD=OFF")
 			.arg("-DSLANG_ENABLE_SLANGI=OFF")
 			.arg("-DSLANG_ENABLE_SLANGRT=OFF")
-			.arg("-DSLANG_ENABLE_REPLAYER=OFF"));
+			.arg("-DSLANG_ENABLE_REPLAYER=OFF");
+		if cfg!(windows) {
+			// Avoid C4819 (code page) warnings being escalated to errors on
+			// non-UTF-8 locales (MSVC-only flag).
+			configure
+				.arg("-DCMAKE_C_FLAGS=/utf-8")
+				.arg("-DCMAKE_CXX_FLAGS=/utf-8");
+		}
+		run(&mut configure);
 	}
 
 	run(Command::new("cmake")
-		.arg("--build").arg(&build_dir)
-		.arg("--config").arg("Release")
-		.arg("--target").arg("slang")
+		.arg("--build")
+		.arg(&build_dir)
+		.arg("--config")
+		.arg("Release")
+		.arg("--target")
+		.arg("slang")
 		.arg("--parallel"));
 
 	// The main target produces slang-compiler.dll; on Windows the `slang`
 	// import library/DLL is a separately-built proxy that forwards to it.
 	if cfg!(windows) {
 		run(Command::new("cmake")
-			.arg("--build").arg(&build_dir)
-			.arg("--config").arg("Release")
-			.arg("--target").arg("slang-proxy")
+			.arg("--build")
+			.arg(&build_dir)
+			.arg("--config")
+			.arg("Release")
+			.arg("--target")
+			.arg("slang-proxy")
 			.arg("--parallel"));
 	}
 
@@ -200,12 +257,22 @@ fn build_from_source(workspace_dir: &Path) -> PathBuf {
 		}
 	}
 
-	panic!("Slang source build finished but no {} found under {}", import_lib_name(), build_dir.display());
+	panic!(
+		"Slang source build finished but no {} found under {}",
+		import_lib_name(),
+		build_dir.display()
+	);
 }
 
 /// Import library (MSVC) or shared library name used to sanity-check lib dirs.
 fn import_lib_name() -> &'static str {
-	if cfg!(windows) { "slang.lib" } else { "libslang.so" }
+	if cfg!(windows) {
+		"slang.lib"
+	} else if cfg!(target_os = "macos") {
+		"libslang.dylib"
+	} else {
+		"libslang.so"
+	}
 }
 
 /// Copy the Slang runtime DLLs next to the test/binary executables so

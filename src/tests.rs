@@ -41,3 +41,1220 @@ fn compile() {
 	let shader_bytecode = linked_program.entry_point_code(0, 0).unwrap();
 	assert_ne!(shader_bytecode.as_slice().len(), 0);
 }
+
+/// Creates a session with a SPIR-V target and the `shaders/` search path,
+/// shared by the tests below.
+fn create_test_session() -> slang::Session {
+	let global_session = slang::GlobalSession::new().unwrap();
+
+	let search_path = std::ffi::CString::new("shaders").unwrap();
+
+	let target_desc = slang::TargetDesc::default()
+		.format(slang::CompileTarget::Spirv)
+		.profile(global_session.find_profile("glsl_450"));
+
+	let targets = [target_desc];
+	let search_paths = [search_path.as_ptr()];
+
+	let session_desc = slang::SessionDesc::default()
+		.targets(&targets)
+		.search_paths(&search_paths);
+
+	global_session.create_session(&session_desc).unwrap()
+}
+
+#[test]
+fn load_module_error() {
+	let session = create_test_session();
+
+	match session.load_module("definitely_not_a_module_xyz") {
+		Err(slang::Error::Blob(blob)) => {
+			let message = blob.as_str().unwrap();
+			assert!(
+				message.contains("definitely_not_a_module_xyz"),
+				"diagnostics should name the missing module, got: {message}"
+			);
+		}
+		Err(slang::Error::Code(_)) => {
+			// Acceptable per the null-diagnostics fallback, but Slang normally
+			// provides a blob for a missing module.
+		}
+		Ok(_) => panic!("loading a nonexistent module should fail"),
+	}
+}
+
+#[test]
+fn load_module_from_source_string_syntax_error() {
+	let session = create_test_session();
+
+	let result = session.load_module_from_source_string(
+		"syntax_error",
+		"syntax_error.slang",
+		"this is not valid slang source !!!",
+	);
+
+	match result {
+		Err(slang::Error::Blob(blob)) => {
+			assert!(
+				blob.as_str().unwrap().contains("error"),
+				"diagnostics should mention the error"
+			);
+		}
+		Err(slang::Error::Code(_)) => {}
+		Ok(_) => panic!("compiling invalid source should fail"),
+	}
+}
+
+#[test]
+fn find_entry_point_not_found() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+
+	assert!(module.find_entry_point_by_name("main").is_some());
+	assert!(
+		module
+			.find_entry_point_by_name("no_such_entry_point")
+			.is_none()
+	);
+}
+
+#[test]
+fn load_module_from_source_string_success() {
+	let session = create_test_session();
+
+	let source = r#"
+[shader("compute")]
+[numthreads(4, 1, 1)]
+void main(uint3 thread_id : SV_DispatchThreadID) {}
+"#;
+
+	let module = session
+		.load_module_from_source_string("inline_test", "inline_test.slang", source)
+		.unwrap();
+	assert_eq!(module.name(), Some("inline_test"));
+
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+
+	let reflection = linked_program.layout(0).unwrap();
+	let reflected_entry_point = reflection.entry_point_by_index(0).unwrap();
+	assert_eq!(reflected_entry_point.compute_thread_group_size(), [4, 1, 1]);
+
+	let code = linked_program.entry_point_code(0, 0).unwrap();
+	assert!(!code.as_slice().is_empty());
+}
+
+#[test]
+fn reflection_details() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let reflection = linked_program.layout(0).unwrap();
+
+	// Parameter count and names.
+	assert_eq!(reflection.parameter_count(), 3);
+	let input_0 = reflection.parameter_by_index(0).unwrap();
+	let input_1 = reflection.parameter_by_index(1).unwrap();
+	let output = reflection.parameter_by_index(2).unwrap();
+	assert_eq!(input_0.name(), Some("input_0"));
+	assert_eq!(input_1.name(), Some("input_1"));
+	assert_eq!(output.name(), Some("output"));
+
+	// Binding locations.
+	assert_eq!(input_0.binding_index(), 0);
+	assert_eq!(input_1.binding_index(), 1);
+	assert_eq!(output.binding_index(), 2);
+	assert_eq!(input_0.binding_space(), 0);
+	assert_eq!(output.binding_space(), 0);
+
+	// Type layout of a StructuredBuffer parameter.
+	let input_0_layout = input_0.type_layout().unwrap();
+	assert_eq!(input_0_layout.kind(), slang::TypeKind::Resource);
+	assert_eq!(
+		input_0_layout.resource_shape(),
+		Some(slang::ResourceShape::SlangStructuredBuffer)
+	);
+	assert_eq!(
+		input_0_layout.resource_access(),
+		Some(slang::ResourceAccess::Read)
+	);
+	assert_eq!(
+		output.type_layout().unwrap().resource_access(),
+		Some(slang::ResourceAccess::ReadWrite)
+	);
+
+	// Binding range of the StructuredBuffer.
+	assert_eq!(input_0_layout.binding_range_count(), 1);
+	assert_eq!(input_0_layout.binding_range_binding_count(0), 1);
+
+	// Element type: a single 4-byte float.
+	let element_layout = input_0_layout.element_type_layout().unwrap();
+	assert_eq!(element_layout.kind(), slang::TypeKind::Scalar);
+	assert_eq!(
+		element_layout.scalar_type(),
+		Some(slang::ScalarType::Float32)
+	);
+	assert_eq!(element_layout.size(slang::ParameterCategory::Uniform), 4);
+
+	// Entry point: name, stage and compute thread group size.
+	assert_eq!(reflection.entry_point_count(), 1);
+	let reflected_entry_point = reflection.entry_point_by_index(0).unwrap();
+	assert_eq!(reflected_entry_point.name(), Some("main"));
+	assert_eq!(reflected_entry_point.stage(), slang::Stage::Compute);
+	assert_eq!(reflected_entry_point.compute_thread_group_size(), [1, 1, 1]);
+}
+
+#[test]
+fn shader_to_json() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let reflection = linked_program.layout(0).unwrap();
+
+	let json = reflection.to_json().unwrap();
+	assert!(
+		json.contains("input_0"),
+		"JSON reflection should name the input_0 parameter, got: {json}"
+	);
+	assert!(
+		json.contains("output"),
+		"JSON reflection should name the output parameter, got: {json}"
+	);
+}
+
+#[test]
+fn shader_bindless_space_index() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let reflection = linked_program.layout(0).unwrap();
+
+	// slang.h documents that the index is a layout-time reservation and may
+	// stay non-negative even when the final code uses no bindless heap; -1
+	// would mean no space was reserved at all. Slang v2026.14.1 reserves
+	// space 1 for this program.
+	assert_eq!(reflection.bindless_space_index(), 1);
+}
+
+#[test]
+fn variable_default_values() {
+	let session = create_test_session();
+
+	let source = r#"
+float foo(float z, float x = 1.5, int y = 42) { return x + y + z; }
+"#;
+
+	let module = session
+		.load_module_from_source_string("defaults", "defaults.slang", source)
+		.unwrap();
+	let program = slang::ComponentType::from(module);
+	let reflection = program.layout(0).unwrap();
+
+	let foo = reflection.find_function_by_name("foo").unwrap();
+	let z = foo.parameter_by_index(0).unwrap();
+	let x = foo.parameter_by_index(1).unwrap();
+	let y = foo.parameter_by_index(2).unwrap();
+
+	assert!(x.has_default_value());
+	assert_eq!(x.default_value_float(), Some(1.5));
+	assert!(y.has_default_value());
+	assert_eq!(y.default_value_int(), Some(42));
+	assert!(!z.has_default_value());
+	assert_eq!(z.default_value_float(), None);
+}
+
+#[test]
+fn decl_find_modifier() {
+	let session = create_test_session();
+
+	let source = r#"
+static int g_counter = 0;
+int bar() { return g_counter; }
+"#;
+
+	let module = session
+		.load_module_from_source_string("modifiers", "modifiers.slang", source)
+		.unwrap();
+	let module_decl = module.module_reflection();
+
+	let var_decl = module_decl
+		.children()
+		.find(|d| d.name() == Some("g_counter"))
+		.unwrap();
+	assert!(
+		var_decl
+			.find_modifier(slang::ModifierID::SlangModifierStatic)
+			.is_some()
+	);
+	assert!(
+		var_decl
+			.find_modifier(slang::ModifierID::SlangModifierConst)
+			.is_none()
+	);
+
+	let func_decl = module_decl
+		.children()
+		.find(|d| d.name() == Some("bar"))
+		.unwrap();
+	assert!(
+		func_decl
+			.find_modifier(slang::ModifierID::SlangModifierStatic)
+			.is_none()
+	);
+}
+
+#[test]
+fn specialized_element_count() {
+	let session = create_test_session();
+
+	let module = session
+		.load_module_from_source_string("arrays", "arrays.slang", "int g_data[8];\n")
+		.unwrap();
+	let program = slang::ComponentType::from(module.clone());
+	let reflection = program.layout(0).unwrap();
+
+	let module_decl = module.module_reflection();
+	let var_decl = module_decl
+		.children()
+		.find(|d| d.name() == Some("g_data"))
+		.unwrap();
+	let ty = var_decl.as_variable().unwrap().ty().unwrap();
+
+	assert_eq!(ty.kind(), slang::TypeKind::Array);
+	assert_eq!(ty.element_count(), 8);
+	// With no unresolved constants, the specialized count matches the plain
+	// element count whether or not a program layout is provided.
+	assert_eq!(ty.specialized_element_count(None), 8);
+	assert_eq!(ty.specialized_element_count(Some(reflection)), 8);
+}
+
+#[test]
+#[allow(deprecated)]
+fn try_resolve_overloaded_function() {
+	let session = create_test_session();
+
+	let source = r#"
+int foo(int x) { return x; }
+float foo(float x) { return x; }
+"#;
+
+	let module = session
+		.load_module_from_source_string("overloaded", "overloaded.slang", source)
+		.unwrap();
+	let program = slang::ComponentType::from(module);
+	let reflection = program.layout(0).unwrap();
+
+	let foo = reflection.find_function_by_name("foo").unwrap();
+	assert!(foo.is_overloaded());
+	assert_eq!(foo.overload_count(), 2);
+
+	let overload_0 = foo.overload_by_index(0).unwrap();
+	let overload_1 = foo.overload_by_index(1).unwrap();
+
+	// A single concrete candidate resolves to itself.
+	let resolved = reflection
+		.try_resolve_overloaded_function(&[overload_0])
+		.unwrap();
+	assert!(std::ptr::eq(resolved, overload_0));
+
+	// With several candidates slang resolves the overload group to a fresh
+	// reflection object for the chosen overload (deprecated API; no call-site
+	// context is taken into account).
+	let resolved = reflection
+		.try_resolve_overloaded_function(&[overload_0, overload_1])
+		.unwrap();
+	assert_eq!(resolved.name(), Some("foo"));
+}
+
+#[test]
+fn specialize_generic_entry_point() {
+	let session = create_test_session();
+
+	let source = r#"
+__generic<T : __BuiltinFloatingPointType>
+[shader("compute")]
+[numthreads(4, 1, 1)]
+void main(RWStructuredBuffer<T> output, uint3 thread_id : SV_DispatchThreadID)
+{
+	output[thread_id.x] = T(1.5);
+}
+"#;
+
+	let module = session
+		.load_module_from_source_string("generic_ep", "generic_ep.slang", source)
+		.unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+
+	// The composite program exposes the entry point's generic parameter as a
+	// specialization parameter.
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	assert_eq!(program.specialization_param_count(), 1);
+
+	// Specializing with `float` resolves the buffer element type.
+	let specialized = program
+		.specialize(&[slang::SpecializationArg::from_expr("float")])
+		.unwrap();
+	assert_eq!(specialized.specialization_param_count(), 0);
+
+	let linked_program = specialized.link().unwrap();
+
+	let reflection = linked_program.layout(0).unwrap();
+	let reflected_entry_point = reflection.entry_point_by_index(0).unwrap();
+	let element_layout = reflected_entry_point
+		.parameter_by_index(0)
+		.unwrap()
+		.type_layout()
+		.unwrap()
+		.element_type_layout()
+		.unwrap();
+	assert_eq!(
+		element_layout.scalar_type(),
+		Some(slang::ScalarType::Float32)
+	);
+
+	let code = linked_program.entry_point_code(0, 0).unwrap();
+	assert!(!code.as_slice().is_empty());
+}
+
+#[test]
+fn specialize_type() {
+	let session = create_test_session();
+
+	// `ISession::specializeType` specializes an existential (interface) type
+	// with concrete type arguments; it is not for generic types like
+	// `Pair<T>`.
+	let source = r#"
+interface IValue
+{
+	int get();
+}
+
+struct ConstantA : IValue
+{
+	int get() { return 1; }
+}
+"#;
+
+	let module = session
+		.load_module_from_source_string("specialize_type", "specialize_type.slang", source)
+		.unwrap();
+	let module_decl = module.module_reflection();
+
+	let find_type = |name: &str| {
+		module_decl
+			.children()
+			.find(|d| d.name() == Some(name))
+			.unwrap()
+			.ty()
+			.unwrap()
+	};
+	let interface_type = find_type("IValue");
+	let impl_type = find_type("ConstantA");
+
+	// Note that `ISession::specializeType` only accepts `Kind::Type` args.
+	let specialized = session
+		.specialize_type(
+			interface_type,
+			&[slang::SpecializationArg::from_type(impl_type)],
+		)
+		.unwrap();
+	assert_eq!(specialized.kind(), slang::TypeKind::Specialized);
+}
+
+#[test]
+fn type_conformance_component_type() {
+	let session = create_test_session();
+
+	let source = r#"
+interface IValue
+{
+	int get();
+}
+
+struct ConstantA : IValue
+{
+	int get() { return 1; }
+}
+
+struct ConstantB : IValue
+{
+	int get() { return 2; }
+}
+
+RWStructuredBuffer<int> output;
+
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void main(uniform IValue value)
+{
+	output[0] = value.get();
+}
+"#;
+
+	let module = session
+		.load_module_from_source_string("conformance", "conformance.slang", source)
+		.unwrap();
+	let module_decl = module.module_reflection();
+
+	let find_type = |name: &str| {
+		module_decl
+			.children()
+			.find(|d| d.name() == Some(name))
+			.unwrap()
+			.ty()
+			.unwrap()
+	};
+	let interface_type = find_type("IValue");
+	let impl_type = find_type("ConstantA");
+
+	let conformance = session
+		.create_type_conformance_component_type(impl_type, interface_type, -1)
+		.unwrap();
+
+	// Including the conformance component in the composite restricts the
+	// dynamic dispatch to `ConstantA`; the program still links and compiles.
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into(), conformance.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+
+	let code = linked_program.entry_point_code(0, 0).unwrap();
+	assert!(!code.as_slice().is_empty());
+}
+
+#[test]
+fn component_type_link_with_options_and_friends() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+
+	// link_with_options smoke test.
+	let options = slang::CompilerOptions::default().optimization(slang::OptimizationLevel::High);
+	let linked_program = program.link_with_options(&options).unwrap();
+	let code = linked_program.entry_point_code(0, 0).unwrap();
+	assert!(!code.as_slice().is_empty());
+
+	// The hash blob is a non-empty dependency hash usable as a cache key.
+	let hash = linked_program.entry_point_hash(0, 0);
+	assert!(!hash.as_slice().is_empty());
+
+	// A component type hands out its owning session, which stays usable.
+	let component_session = program.get_session();
+	let module_again = component_session.load_module("test.slang").unwrap();
+	assert_eq!(module_again.name(), Some("test.slang"));
+
+	// rename_entry_point returns a new component type that links and compiles
+	// (the new name affects the generated entry point symbol, not the
+	// reflection of the original function).
+	let renamed_linked = program
+		.rename_entry_point("renamed_main")
+		.unwrap()
+		.link()
+		.unwrap();
+	let renamed_code = renamed_linked.entry_point_code(0, 0).unwrap();
+	assert!(!renamed_code.as_slice().is_empty());
+}
+
+#[test]
+fn query_interface_and_cast_as() {
+	use slang::Interface;
+
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+
+	// Sub-interfaces query their base interface successfully; casts to
+	// unrelated interfaces return `None`.
+	assert!(
+		module
+			.as_unknown()
+			.query_interface::<slang::ComponentType>()
+			.is_some()
+	);
+	assert!(
+		entry_point
+			.as_unknown()
+			.query_interface::<slang::ComponentType>()
+			.is_some()
+	);
+	assert!(
+		entry_point
+			.as_unknown()
+			.query_interface::<slang::Module>()
+			.is_none()
+	);
+	assert!(
+		module
+			.as_unknown()
+			.query_interface::<slang::GlobalSession>()
+			.is_none()
+	);
+
+	// `castAs` on `IMetadata`: a self-cast succeeds, unrelated interfaces fail.
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let metadata = linked_program.target_metadata(0).unwrap();
+	assert!(metadata.cast_as::<slang::Metadata>().is_some());
+	assert!(metadata.cast_as::<slang::Blob>().is_none());
+}
+
+#[test]
+fn ir_blob_round_trip() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+
+	// Serialize to an IR blob and read its info back.
+	let ir_blob = module.serialize().unwrap();
+	let info = session.module_info_from_ir_blob(&ir_blob).unwrap();
+	assert_eq!(info.name, Some("test.slang"));
+
+	// A freshly serialized module is up-to-date against its own source.
+	assert!(session.is_binary_module_up_to_date("shaders/test.slang", &ir_blob));
+
+	// Load the module back from the blob and compile it end to end.
+	let loaded = session
+		.load_module_from_ir_blob("test_ir", "test_ir.slang", &ir_blob)
+		.unwrap();
+	let entry_point = loaded.find_entry_point_by_name("main").unwrap();
+	let program = session
+		.create_composite_component_type(&[loaded.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let code = linked_program.entry_point_code(0, 0).unwrap();
+	assert!(!code.as_slice().is_empty());
+}
+
+#[test]
+fn core_module_round_trip() {
+	// Save the core module from a fully initialized global session.
+	let global_session = slang::GlobalSession::new().unwrap();
+	let core_blob = global_session
+		.save_core_module(slang::ArchiveType::RiffLz4)
+		.unwrap();
+	assert!(!core_blob.as_slice().is_empty());
+
+	// A global session created without the core module becomes usable after
+	// loading the serialized core module.
+	let bare_global_session = slang::GlobalSession::new_without_core_module().unwrap();
+	bare_global_session
+		.load_core_module(core_blob.as_slice())
+		.unwrap();
+
+	let target_desc = slang::TargetDesc::default().format(slang::CompileTarget::Spirv);
+	let targets = [target_desc];
+	let session_desc = slang::SessionDesc::default().targets(&targets);
+	let session = bare_global_session.create_session(&session_desc).unwrap();
+	let module = session
+		.load_module_from_source_string("core_test", "core_test.slang", "int foo() { return 1; }\n")
+		.unwrap();
+	assert_eq!(module.name(), Some("core_test"));
+
+	// `compile_core_module` is the alternative way to fill in a bare global
+	// session, compiling the core module from embedded source.
+	let bare_global_session = slang::GlobalSession::new_without_core_module().unwrap();
+	bare_global_session.compile_core_module(0).unwrap();
+	let session = bare_global_session.create_session(&session_desc).unwrap();
+	let module = session
+		.load_module_from_source_string(
+			"core_test_2",
+			"core_test_2.slang",
+			"int bar() { return 2; }\n",
+		)
+		.unwrap();
+	assert_eq!(module.name(), Some("core_test_2"));
+}
+
+#[test]
+fn session_desc_preprocessor_macros() {
+	let global_session = slang::GlobalSession::new().unwrap();
+
+	let target_desc = slang::TargetDesc::default().format(slang::CompileTarget::Spirv);
+	let targets = [target_desc];
+	let macros = [slang::PreprocessorMacroDesc::new("M3B_WITH_OUTPUT", "1")];
+	let session_desc = slang::SessionDesc::default()
+		.targets(&targets)
+		.preprocessor_macros(&macros);
+	let session = global_session.create_session(&session_desc).unwrap();
+
+	let source = r#"
+#ifdef M3B_WITH_OUTPUT
+RWStructuredBuffer<int> output;
+#endif
+
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void main() {}
+"#;
+
+	let module = session
+		.load_module_from_source_string("macros", "macros.slang", source)
+		.unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let reflection = linked_program.layout(0).unwrap();
+	assert_eq!(reflection.parameter_count(), 1);
+}
+
+#[test]
+fn session_desc_allow_glsl_syntax() {
+	let global_session = slang::GlobalSession::new().unwrap();
+
+	let target_desc = slang::TargetDesc::default().format(slang::CompileTarget::Spirv);
+	let targets = [target_desc];
+	let session_desc = slang::SessionDesc::default()
+		.targets(&targets)
+		.allow_glsl_syntax(true);
+	let session = global_session.create_session(&session_desc).unwrap();
+
+	// Smoke: a session with GLSL syntax enabled still compiles plain Slang.
+	let module = session
+		.load_module_from_source_string(
+			"glsl_smoke",
+			"glsl_smoke.slang",
+			"int foo() { return 1; }\n",
+		)
+		.unwrap();
+	assert_eq!(module.name(), Some("glsl_smoke"));
+}
+
+#[test]
+fn check_compile_target_and_pass_through_support() {
+	let global_session = slang::GlobalSession::new().unwrap();
+
+	// SPIR-V codegen is compiled into the library itself; DXIL depends on an
+	// external DXC, so only SPIR-V is asserted here.
+	assert!(
+		global_session
+			.check_compile_target_support(slang::CompileTarget::Spirv)
+			.is_ok()
+	);
+
+	// The prebuilt Slang binaries ship slang-glslang.
+	assert!(
+		global_session
+			.check_pass_through_support(slang::PassThrough::Glslang)
+			.is_ok()
+	);
+}
+
+#[test]
+fn parse_command_line_arguments() {
+	let global_session = slang::GlobalSession::new().unwrap();
+
+	let parsed = global_session
+		.parse_command_line_arguments(&["-target", "spirv"])
+		.unwrap();
+	assert_eq!(parsed.targetCount, 1);
+
+	// The parsed desc drives session creation directly.
+	let session = global_session.create_session(&parsed).unwrap();
+	let module = session
+		.load_module_from_source_string("parsed", "parsed.slang", "int foo() { return 1; }\n")
+		.unwrap();
+	assert_eq!(module.name(), Some("parsed"));
+}
+
+#[test]
+fn loaded_modules() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+
+	assert!(session.loaded_module_count() >= 1);
+	let found = session
+		.loaded_modules()
+		.find(|m| m.name() == Some("test.slang"))
+		.expect("the loaded module list should contain test.slang");
+	assert_eq!(found.unique_identity(), module.unique_identity());
+
+	// The session hands its global session back.
+	let _global_session = session.get_global_session();
+}
+
+#[test]
+fn module_serialize_write_disassemble_and_find_and_check() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+
+	// write_to_file produces a non-empty binary module file.
+	let path = std::env::temp_dir().join("shader_slang_rs_m3b_test.slang-module");
+	let path_str = path.to_str().unwrap();
+	module.write_to_file(path_str).unwrap();
+	let bytes = std::fs::read(&path).unwrap();
+	assert!(!bytes.is_empty());
+	std::fs::remove_file(&path).unwrap();
+
+	// disassemble produces human-readable IR text.
+	let disassembly = module.disassemble().unwrap();
+	assert!(
+		disassembly.contains("main"),
+		"disassembly should mention the main entry point, got: {disassembly}"
+	);
+
+	// find_and_check_entry_point validates functions that carry no entry point
+	// attributes at all. (Note: `[numthreads]` alone already makes
+	// `find_entry_point_by_name` succeed in Slang v2026.14.1 — it implicitly
+	// designates a compute entry point.)
+	let plain = session
+		.load_module_from_source_string("plain_ep", "plain_ep.slang", "void cs_main() {}\n")
+		.unwrap();
+	assert!(plain.find_entry_point_by_name("cs_main").is_none());
+	let entry_point = plain
+		.find_and_check_entry_point("cs_main", slang::Stage::Compute)
+		.unwrap();
+	assert_eq!(entry_point.function_reflection().name(), Some("cs_main"));
+}
+
+#[test]
+fn session_type_utilities() {
+	let session = create_test_session();
+
+	let source = r#"
+interface IValue
+{
+	int get();
+}
+
+struct ConstantA : IValue
+{
+	int get() { return 1; }
+}
+
+struct Plain
+{
+	float x;
+	int y;
+}
+"#;
+
+	let module = session
+		.load_module_from_source_string("type_utils", "type_utils.slang", source)
+		.unwrap();
+	let module_decl = module.module_reflection();
+
+	let find_type = |name: &str| {
+		module_decl
+			.children()
+			.find(|d| d.name() == Some(name))
+			.unwrap()
+			.ty()
+			.unwrap()
+	};
+	let interface_type = find_type("IValue");
+	let impl_type = find_type("ConstantA");
+	let plain_type = find_type("Plain");
+
+	// Standalone type layout.
+	let layout = session
+		.type_layout(plain_type, 0, slang::LayoutRules::Default)
+		.unwrap();
+	assert_eq!(layout.kind(), slang::TypeKind::Struct);
+	assert_eq!(layout.field_count(), 2);
+
+	// Container type: Plain -> StructuredBuffer<Plain>.
+	let buffer_type = session
+		.container_type(plain_type, slang::ContainerType::StructuredBuffer)
+		.unwrap();
+	assert_eq!(buffer_type.kind(), slang::TypeKind::Resource);
+
+	// The __Dynamic type is available for specialization arguments.
+	let _dynamic = session.dynamic_type();
+
+	// RTTI / witness helpers.
+	let rtti_name = session.type_rtti_mangled_name(impl_type).unwrap();
+	assert!(!rtti_name.as_slice().is_empty());
+	let witness_name = session
+		.type_conformance_witness_mangled_name(impl_type, interface_type)
+		.unwrap();
+	assert!(!witness_name.as_slice().is_empty());
+	let _witness_id = session
+		.type_conformance_witness_sequential_id(impl_type, interface_type)
+		.unwrap();
+	let rtti_bytes = session
+		.dynamic_object_rtti_bytes(impl_type, interface_type, 32)
+		.unwrap();
+	assert!(rtti_bytes.len() >= 4);
+
+	// Source locations of declarations.
+	let plain_decl = module_decl
+		.children()
+		.find(|d| d.name() == Some("Plain"))
+		.unwrap();
+	let location = session.decl_source_location(plain_decl).unwrap();
+	assert!(
+		location.file_path().unwrap().contains("type_utils.slang"),
+		"unexpected source file: {:?}",
+		location.file_path()
+	);
+	assert!(location.line() > 0);
+}
+
+#[test]
+fn compile_results() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+
+	// The linked component type implements IComponentType2 in Slang v2026.14.1.
+	let component2 = linked_program
+		.as_component_type2()
+		.expect("linked component type should implement IComponentType2");
+
+	let target_result = component2.target_compile_result(0).unwrap();
+	assert!(target_result.item_count() > 0);
+	// Item 0 is the base SPIR-V. Slang v2026.14.1 reports an additional slot
+	// for the debug SPIR-V, which errors with `SLANG_E_NOT_FOUND` when no
+	// separate debug compilation was requested.
+	assert_eq!(target_result.item_count(), 2);
+	assert!(!target_result.item_data(0).unwrap().as_slice().is_empty());
+	assert!(target_result.item_data(1).is_err());
+	let _metadata = target_result.metadata().unwrap();
+
+	let entry_point_result = component2.entry_point_compile_result(0, 0).unwrap();
+	assert!(entry_point_result.item_count() > 0);
+	assert!(
+		!entry_point_result
+			.item_data(0)
+			.unwrap()
+			.as_slice()
+			.is_empty()
+	);
+	let _metadata = entry_point_result.metadata().unwrap();
+
+	// Out-of-range indices are reported as errors, not panics.
+	assert!(target_result.item_data(target_result.item_count()).is_err());
+}
+
+#[test]
+fn bindless_resource_metadata() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let metadata = linked_program.target_metadata(0).unwrap();
+
+	// `IBindlessResourceMetadata` is always available on target metadata in
+	// Slang v2026.14.1; test.slang uses no descriptor handles, so the
+	// post-lowering usage signal is false.
+	let bindless = metadata
+		.cast_as::<slang::BindlessResourceMetadata>()
+		.expect("target metadata should cast to IBindlessResourceMetadata");
+	assert!(!bindless.uses_bindless_resource_heap());
+}
+
+#[test]
+fn coverage_synthetic_and_cooperative_metadata() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let metadata = linked_program.target_metadata(0).unwrap();
+
+	// In Slang v2026.14.1 these metadata interfaces are always implemented on
+	// target metadata; a plain shader compiled without coverage
+	// instrumentation simply reports zero counters/entries/resources.
+	let coverage = metadata
+		.cast_as::<slang::CoverageTracingMetadata>()
+		.expect("target metadata should cast to ICoverageTracingMetadata");
+	assert_eq!(coverage.counter_count(), 0);
+	assert_eq!(coverage.entry_count(), 0);
+
+	let synthetic = metadata
+		.cast_as::<slang::SyntheticResourceMetadata>()
+		.expect("target metadata should cast to ISyntheticResourceMetadata");
+	assert_eq!(synthetic.resource_count(), 0);
+
+	// `ICooperativeTypesMetadata` likewise reports empty lists when no
+	// cooperative types survive lowering.
+	let cooperative = metadata
+		.cast_as::<slang::CooperativeTypesMetadata>()
+		.expect("target metadata should cast to ICooperativeTypesMetadata");
+	assert_eq!(cooperative.cooperative_matrix_type_count(), 0);
+	assert_eq!(cooperative.cooperative_matrix_combination_count(), 0);
+	assert_eq!(cooperative.cooperative_vector_type_count(), 0);
+	assert_eq!(cooperative.cooperative_vector_combination_count(), 0);
+}
+
+#[test]
+fn debug_build_identifier() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let metadata = linked_program.target_metadata(0).unwrap();
+
+	// Smoke: without separate debug compilation Slang v2026.14.1 hands back an
+	// empty identifier string; either way the call must succeed.
+	let _ = metadata.get_debug_build_identifier();
+}
+
+// --- FileSystem (reverse COM) tests ---
+
+/// In-memory [`slang::FileSystem`] for the tests below. Paths are matched by
+/// their final component so the tests do not depend on how Slang
+/// canonicalizes candidate paths.
+struct VirtualFileSystem {
+	files: std::collections::HashMap<String, Vec<u8>>,
+	requested: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+	on_drop: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl VirtualFileSystem {
+	fn new(files: &[(&str, &str)]) -> Self {
+		Self {
+			files: files
+				.iter()
+				.map(|(path, source)| (path.to_string(), source.as_bytes().to_vec()))
+				.collect(),
+			requested: Default::default(),
+			on_drop: None,
+		}
+	}
+}
+
+impl slang::FileSystem for VirtualFileSystem {
+	fn load_file(&self, path: &str) -> Result<Vec<u8>, slang::FileSystemError> {
+		self.requested.lock().unwrap().push(path.to_string());
+		let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+		self.files
+			.get(name)
+			.cloned()
+			.ok_or(slang::FileSystemError::NotFound)
+	}
+}
+
+impl Drop for VirtualFileSystem {
+	fn drop(&mut self) {
+		if let Some(counter) = &self.on_drop {
+			counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		}
+	}
+}
+
+const VIRTUAL_SHADER: &str = "
+RWStructuredBuffer<int> output;
+
+[shader(\"compute\")]
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    output[id.x] = 42;
+}
+";
+
+/// Creates a SPIR-V session that loads sources through `file_system`.
+fn create_fs_session(file_system: &slang::FileSystemObject) -> slang::Session {
+	let global_session = slang::GlobalSession::new().unwrap();
+
+	let target_desc = slang::TargetDesc::default()
+		.format(slang::CompileTarget::Spirv)
+		.profile(global_session.find_profile("glsl_450"));
+
+	let targets = [target_desc];
+
+	let session_desc = slang::SessionDesc::default()
+		.targets(&targets)
+		.file_system(file_system);
+
+	global_session.create_session(&session_desc).unwrap()
+}
+
+/// The C++ -> Rust callback chain: a module that only exists in the virtual
+/// file system must compile end to end.
+#[test]
+fn file_system_virtual_module() {
+	let fs = VirtualFileSystem::new(&[("virtual_test.slang", VIRTUAL_SHADER)]);
+	let requested = fs.requested.clone();
+	let fs = slang::FileSystemObject::new(fs);
+	let session = create_fs_session(&fs);
+
+	let module = session.load_module("virtual_test").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let code = linked_program.entry_point_code(0, 0).unwrap();
+	assert!(!code.as_slice().is_empty());
+
+	// The module has no on-disk counterpart, so a successful load proves the
+	// C++ side really called back into the Rust implementation.
+	let requested = requested.lock().unwrap();
+	assert!(
+		requested
+			.iter()
+			.any(|path| path.ends_with("virtual_test.slang")),
+		"Slang should have requested virtual_test.slang, got: {requested:?}"
+	);
+}
+
+/// `import` resolution goes through the file system as well.
+#[test]
+fn file_system_import() {
+	let fs = VirtualFileSystem::new(&[
+		(
+			"main.slang",
+			"
+import child;
+
+RWStructuredBuffer<int> output;
+
+[shader(\"compute\")]
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    output[id.x] = getValue();
+}
+",
+		),
+		(
+			"child.slang",
+			"
+public int getValue()
+{
+    return 42;
+}
+",
+		),
+	]);
+	let requested = fs.requested.clone();
+	let fs = slang::FileSystemObject::new(fs);
+	let session = create_fs_session(&fs);
+
+	let module = session.load_module("main").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let code = linked_program.entry_point_code(0, 0).unwrap();
+	assert!(!code.as_slice().is_empty());
+
+	let requested = requested.lock().unwrap();
+	assert!(
+		requested.iter().any(|path| path.ends_with("child.slang")),
+		"import resolution should have requested child.slang, got: {requested:?}"
+	);
+}
+
+/// `FileSystemError::NotFound` propagates as a module load failure.
+#[test]
+fn file_system_not_found() {
+	let fs = slang::FileSystemObject::new(VirtualFileSystem::new(&[]));
+	let session = create_fs_session(&fs);
+
+	assert!(
+		session.load_module("missing_module").is_err(),
+		"a module the file system cannot provide must fail to load"
+	);
+}
+
+struct PanicFileSystem;
+
+impl slang::FileSystem for PanicFileSystem {
+	fn load_file(&self, _path: &str) -> Result<Vec<u8>, slang::FileSystemError> {
+		panic!("deliberate panic in load_file");
+	}
+}
+
+/// A panic in the callback must not unwind into C++; the load fails instead.
+#[test]
+fn file_system_panic_is_contained() {
+	let fs = slang::FileSystemObject::new(PanicFileSystem);
+	let session = create_fs_session(&fs);
+
+	assert!(
+		session.load_module("anything").is_err(),
+		"a panicking file system must surface as a load error, not an abort"
+	);
+}
+
+/// Slang `addRef`s the file system at `createSession` time, so the session
+/// stays usable after the wrapper is dropped; the Rust object is reclaimed
+/// exactly when the session's last reference goes away.
+#[test]
+fn file_system_outlives_wrapper() {
+	use std::sync::Arc;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	let drops = Arc::new(AtomicUsize::new(0));
+	let mut fs = VirtualFileSystem::new(&[("virtual_test.slang", VIRTUAL_SHADER)]);
+	fs.on_drop = Some(drops.clone());
+	let fs = slang::FileSystemObject::new(fs);
+
+	let session = create_fs_session(&fs);
+
+	// The session holds its own COM reference; dropping our handle must not
+	// free the object.
+	drop(fs);
+	assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+	let module = session.load_module("virtual_test").unwrap();
+	drop(module);
+	drop(session);
+	assert_eq!(
+		drops.load(Ordering::SeqCst),
+		1,
+		"the Rust object should be reclaimed on the final release"
+	);
+}
+
+/// The `queryInterface` thunk answers the interface's own IID from Rust.
+#[test]
+fn file_system_query_interface() {
+	use slang::Interface;
+
+	let fs = slang::FileSystemObject::new(VirtualFileSystem::new(&[]));
+	assert!(
+		fs.as_unknown()
+			.query_interface::<slang::FileSystemObject>()
+			.is_some()
+	);
+}
