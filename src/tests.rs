@@ -1895,9 +1895,17 @@ fn module_precompile_service() {
 #[test]
 fn byte_code_runner() {
 	// Smoke: creating a runner and querying it without a loaded module must
-	// not crash. There is no public way to produce a Slang bytecode module in
-	// v2026.14.1, so `loadModule`/`execute` stay untested.
+	// not crash. Slang v2026.14.1 leaves the interpreter's module view
+	// uninitialized until `loadModule` succeeds and reads it unconditionally
+	// in these queries, so the wrapper short-circuits them itself until a
+	// module has been loaded (see the `ByteCodeRunner` docs).
 	let runner = slang::ByteCodeRunner::new().unwrap();
 	assert_eq!(runner.find_function_by_name("main"), -1);
+	assert!(runner.function_info(0).is_err());
+	assert!(runner.select_function_by_index(0).is_err());
+	// `getErrorString` only reads the runner's error string builder, so it is
+	// safe (and useful) without a loaded module.
 	let _ = runner.error_string();
+	// There is no public way to produce a Slang bytecode module in
+	// v2026.14.1, so `loadModule`/`execute` stay untested.
 }

@@ -62,6 +62,8 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{null, null_mut};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) use shader_slang_rs_sys as sys;
 
@@ -2982,12 +2984,30 @@ impl ModulePrecompileService {
 /// `setPrintCallback`, `setExtInstHandlerUserData`) are deliberately not
 /// wrapped; the sys vtable still carries their slots.
 ///
+/// Loaded-state guard: in Slang v2026.14.1 the interpreter object leaves its
+/// module view uninitialized until `loadModule` succeeds, and
+/// `findFunctionByName`/`getFunctionInfo`/`selectFunctionByIndex` read it
+/// unconditionally — calling them on a fresh runner dereferences indeterminate
+/// memory inside Slang (observed as a SIGBUS on macOS aarch64). The wrapper
+/// therefore tracks whether a module was loaded successfully and short-circuits
+/// the module-dependent queries itself until then.
+///
 /// NOTE: this API is experimental in Slang.
+#[derive(Clone)]
+pub struct ByteCodeRunner {
+	inner: ByteCodeRunnerInner,
+	// Shared across clones so every handle to the same runner agrees on
+	// whether a module was loaded.
+	module_loaded: Arc<AtomicBool>,
+}
+
+/// The raw COM wrapper behind [`ByteCodeRunner`], kept `repr(transparent)` so
+/// the [`Interface`] safety contract holds.
 #[repr(transparent)]
 #[derive(Clone)]
-pub struct ByteCodeRunner(IUnknown);
+struct ByteCodeRunnerInner(IUnknown);
 
-unsafe impl Interface for ByteCodeRunner {
+unsafe impl Interface for ByteCodeRunnerInner {
 	type Vtable = sys::IByteCodeRunnerVtable;
 	const IID: UUID = uuid(0xafda_b195_361f_42cb_9513_9006_261d_d8cd);
 }
@@ -3006,27 +3026,34 @@ impl ByteCodeRunner {
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
-		Ok(ByteCodeRunner(IUnknown(
-			std::ptr::NonNull::new(runner as *mut _).unwrap(),
-		)))
+		Ok(ByteCodeRunner {
+			inner: ByteCodeRunnerInner(IUnknown(std::ptr::NonNull::new(runner as *mut _).unwrap())),
+			module_loaded: Arc::new(AtomicBool::new(false)),
+		})
 	}
 
 	/// Loads a bytecode module blob into the execution context
 	/// (`IByteCodeRunner::loadModule`).
 	pub fn load_module(&self, module: &Blob) -> Result<()> {
-		let result = vcall!(self, loadModule(module.as_raw()));
+		let result = vcall!(self.inner, loadModule(module.as_raw()));
 		// `loadModule` takes no diagnostics out-pointer; the result code is
 		// the only error signal.
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
+		self.module_loaded.store(true, Ordering::Release);
 		Ok(())
 	}
 
 	/// Selects the function at `index` for execution
-	/// (`IByteCodeRunner::selectFunctionByIndex`).
+	/// (`IByteCodeRunner::selectFunctionByIndex`). Returns `Err` with
+	/// `SLANG_FAIL` when no module has been loaded yet.
 	pub fn select_function_by_index(&self, index: u32) -> Result<()> {
-		let result = vcall!(self, selectFunctionByIndex(index));
+		// See the loaded-state guard note on `ByteCodeRunner`.
+		if !self.module_loaded.load(Ordering::Acquire) {
+			return Err(Error::Code(sys::SLANG_FAIL));
+		}
+		let result = vcall!(self.inner, selectFunctionByIndex(index));
 		// `selectFunctionByIndex` takes no diagnostics out-pointer; the result
 		// code is the only error signal.
 		if !succeeded(result) {
@@ -3039,17 +3066,26 @@ impl ByteCodeRunner {
 	/// (`IByteCodeRunner::findFunctionByName`), or -1 when the loaded module
 	/// has no such function (or no module is loaded).
 	pub fn find_function_by_name(&self, name: &str) -> i32 {
+		// See the loaded-state guard note on `ByteCodeRunner`.
+		if !self.module_loaded.load(Ordering::Acquire) {
+			return -1;
+		}
 		let name = CString::new(name).unwrap();
-		vcall!(self, findFunctionByName(name.as_ptr()))
+		vcall!(self.inner, findFunctionByName(name.as_ptr()))
 	}
 
 	/// Gets the info of the function at `index`
-	/// (`IByteCodeRunner::getFunctionInfo`).
+	/// (`IByteCodeRunner::getFunctionInfo`). Returns `Err` with `SLANG_FAIL`
+	/// when no module has been loaded yet.
 	pub fn function_info(&self, index: u32) -> Result<ByteCodeFuncInfo> {
+		// See the loaded-state guard note on `ByteCodeRunner`.
+		if !self.module_loaded.load(Ordering::Acquire) {
+			return Err(Error::Code(sys::SLANG_FAIL));
+		}
 		// SAFETY: `slang_ByteCodeFuncInfo` is a C struct of scalars; an
 		// all-zero value is a valid instance.
 		let mut info: sys::slang_ByteCodeFuncInfo = unsafe { std::mem::zeroed() };
-		let result = vcall!(self, getFunctionInfo(index, &mut info));
+		let result = vcall!(self.inner, getFunctionInfo(index, &mut info));
 		// `getFunctionInfo` takes no diagnostics out-pointer; the result code
 		// is the only error signal.
 		if !succeeded(result) {
@@ -3060,9 +3096,14 @@ impl ByteCodeRunner {
 
 	/// Gets the runner's error string, if any
 	/// (`IByteCodeRunner::getErrorString`).
+	///
+	/// This one is safe to call without a loaded module: the Slang
+	/// implementation only reads its (properly constructed) error string
+	/// builder, and a failed [`ByteCodeRunner::load_module`] reports its
+	/// parse errors here.
 	pub fn error_string(&self) -> Option<Blob> {
 		let mut blob = null_mut();
-		vcall!(self, getErrorString(&mut blob));
+		vcall!(self.inner, getErrorString(&mut blob));
 		Some(Blob(IUnknown(std::ptr::NonNull::new(blob as *mut _)?)))
 	}
 }
