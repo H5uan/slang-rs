@@ -1,6 +1,6 @@
 [package]
 name = "shader-slang-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Rust bindings for the Slang shader language compiler"
@@ -15,7 +15,7 @@ categories = ["compilers", "api-bindings"]
 exclude = ["slang/", "target/", "AGENTS.md"]
 
 [dependencies]
-shader-slang-rs-sys = { path = "shader-slang-rs-sys", version = "0.1.0" }
+shader-slang-rs-sys = { path = "shader-slang-rs-sys", version = "0.2.0" }
 
 [features]
 serde = ["shader-slang-rs-sys/serde"]
