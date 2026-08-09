@@ -25,7 +25,7 @@ cargo test --features source-build   # 改用 cmake 构建 slang/ 子模块(首�
 ```
 
 - 环境变量 `SLANG_DIR` / `SLANG_LIB_DIR` / `SLANG_INCLUDE_DIR` 可覆盖库和头文件位置。
-- 运行时动态链接 Slang 共享库;Windows 下 build.rs 会把 DLL 拷到可执行文件目录,Linux/macOS 下 `cargo test`/`cargo run` 通过 Cargo 的动态库搜索路径(rustc-link-search 在 target/ 内自动加入 `LD_LIBRARY_PATH`/`DYLD_FALLBACK_LIBRARY_PATH`)找到 `libslang.so`/`libslang.dylib`,脱离 Cargo 运行的二进制需自行配置 rpath 或 loader path。
+- 运行时动态链接 Slang 共享库;build.rs 会把运行时库(Windows 的 DLL、Linux 的 `libslang*.so*`、macOS 的 `libslang*.dylib*`,含版本化 soname 别名)拷到 Cargo profile 目录及其 `deps/`(`cargo test`/`cargo run` 的 loader 搜索路径只含这两个目录,rustc-link-search 不在运行时搜索路径里)。脱离 Cargo 运行的二进制需自行配置 rpath 或 loader path。
 - 平台:Windows/MSVC 本机实测;Linux x86_64/aarch64 与 macOS x86_64/aarch64 走官方预编译包(代码按 release artifact 事实编写,**未经本机实测**)。
 - 工具链:edition 2024,需要 Rust 1.85+。
 

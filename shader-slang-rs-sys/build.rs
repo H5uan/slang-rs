@@ -67,14 +67,14 @@ fn main() {
 	println!("cargo:rustc-link-search=native={}", lib_dir.display());
 	println!("cargo:rustc-link-lib=dylib=slang");
 
-	// Runtime library lookup: on Windows the DLLs are copied next to the
-	// executables below. On Linux/macOS no copying is needed for
-	// `cargo test`/`cargo run`: Cargo extends LD_LIBRARY_PATH /
-	// DYLD_FALLBACK_LIBRARY_PATH with every `rustc-link-search` directory
-	// that lives inside target/, which the slang-bin cache satisfies.
-	// Downstream binaries running outside Cargo must arrange their own
-	// rpath / loader path (or set SLANG_DIR and handle it themselves).
-	copy_dlls_to_profile_dir(&lib_dir);
+	// Runtime library lookup: Cargo only puts the profile directory and its
+	// deps/ subdirectory on the loader search path (LD_LIBRARY_PATH /
+	// DYLD_FALLBACK_LIBRARY_PATH on Unix); the rustc-link-search directory is
+	// NOT searched at runtime, so the shared libraries must be copied next to
+	// the executables on every platform. Downstream binaries running outside
+	// Cargo must arrange their own rpath / loader path (or set SLANG_DIR and
+	// handle it themselves).
+	copy_runtime_libs_to_profile_dir(&lib_dir);
 
 	let out_dir = env::var("OUT_DIR").expect("Couldn't determine output directory.");
 
@@ -275,13 +275,14 @@ fn import_lib_name() -> &'static str {
 	}
 }
 
-/// Copy the Slang runtime DLLs next to the test/binary executables so
-/// `cargo test` and `cargo run` can load them without extra PATH setup.
-fn copy_dlls_to_profile_dir(lib_dir: &Path) {
-	if !cfg!(windows) {
-		return;
-	}
-
+/// Copy the Slang runtime libraries next to the test/binary executables so
+/// `cargo test` and `cargo run` can load them without extra setup.
+///
+/// Slang's companion libraries use versioned sonames
+/// (`libslang-compiler.so.0.2026.14.1`, `libslang-compiler.0.2026.14.1.dylib`),
+/// so every alias must be present under its own name. Symlinks are recreated
+/// as symlinks to avoid duplicating the (large) library contents.
+fn copy_runtime_libs_to_profile_dir(lib_dir: &Path) {
 	let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 	// OUT_DIR is <profile>/build/<pkg>-<hash>/out.
 	let Some(profile_dir) = out_dir.ancestors().nth(3).map(|p| p.to_path_buf()) else {
@@ -289,20 +290,42 @@ fn copy_dlls_to_profile_dir(lib_dir: &Path) {
 	};
 
 	let bin_dir = lib_dir.parent().map(|p| p.join("bin"));
-	let dll_dirs = [Some(lib_dir), bin_dir.as_deref().filter(|p| p.exists())];
+	let lib_dirs = [Some(lib_dir), bin_dir.as_deref().filter(|p| p.exists())];
 
-	for dir in dll_dirs.into_iter().flatten() {
+	for dir in lib_dirs.into_iter().flatten() {
 		for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
 			let path = entry.path();
-			if path.extension().is_some_and(|ext| ext == "dll") {
-				for dest_dir in [&profile_dir, &profile_dir.join("deps")] {
-					if dest_dir.exists() {
-						let _ = std::fs::copy(&path, dest_dir.join(path.file_name().unwrap()));
-					}
+			let name = path.file_name().unwrap().to_str().unwrap_or_default();
+			let is_runtime_lib = if cfg!(windows) {
+				path.extension().is_some_and(|ext| ext == "dll")
+			} else {
+				name.starts_with("libslang") && (name.contains(".so") || name.contains(".dylib"))
+			};
+			if !is_runtime_lib {
+				continue;
+			}
+			for dest_dir in [&profile_dir, &profile_dir.join("deps")] {
+				if !dest_dir.exists() {
+					continue;
 				}
+				copy_preserving_symlinks(&path, &dest_dir.join(name));
 			}
 		}
 	}
+}
+
+/// Copy `src` to `dest`; on Unix a symlink is recreated as a symlink
+/// pointing at the same (relative) target instead of duplicating contents.
+fn copy_preserving_symlinks(src: &Path, dest: &Path) {
+	#[cfg(unix)]
+	if std::fs::symlink_metadata(src).is_ok_and(|m| m.file_type().is_symlink()) {
+		if let Ok(target) = std::fs::read_link(src) {
+			let _ = std::fs::remove_file(dest);
+			let _ = std::os::unix::fs::symlink(target, dest);
+			return;
+		}
+	}
+	let _ = std::fs::copy(src, dest);
 }
 
 fn run(command: &mut Command) {

@@ -67,7 +67,7 @@ shader-slang-rs = "0.1"
 
 The low-level FFI bindings live in the separate `shader-slang-rs-sys` crate, which `shader-slang-rs` re-exports as needed; depend on it directly only if you want to work with the raw API.
 
-By default, the build script automatically downloads the prebuilt Slang v2026.14.1 binaries for your platform from the [Slang releases page](https://github.com/shader-slang/slang/releases) and caches them in `target/slang-bin`. No manual setup is required: on Windows `slang.dll` is copied next to your executable automatically, and on Linux/macOS `cargo build`/`cargo test`/`cargo run` find `libslang.so`/`libslang.dylib` through Cargo's dynamic library search path. Standalone binaries run outside of Cargo need `libslang` on the loader path (e.g. via rpath or `LD_LIBRARY_PATH`).
+By default, the build script automatically downloads the prebuilt Slang v2026.14.1 binaries for your platform from the [Slang releases page](https://github.com/shader-slang/slang/releases) and caches them in `target/slang-bin`. No manual setup is required: the runtime libraries (`slang.dll`, `libslang*.so*`, `libslang*.dylib*`, including versioned soname aliases) are copied next to your executables automatically, so `cargo build`/`cargo test`/`cargo run` work out of the box on every platform. Standalone binaries run outside of Cargo need `libslang` on the loader path (e.g. via rpath or `LD_LIBRARY_PATH`).
 
 If you prefer to build Slang from source, enable the `source-build` feature. This builds the pinned `slang/` git submodule (v2026.14.1) with CMake:
 
