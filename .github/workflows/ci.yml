@@ -36,4 +36,8 @@ jobs:
       # the verification path for the Linux/macOS branches of
       # shader-slang-rs-sys/build.rs, which are written against the release
       # artifacts but cannot be exercised on the Windows dev machine.
-      - run: cargo test --workspace
+      #
+      # `--test-threads=1` avoids a flaky SIGBUS on the macOS CI runner
+      # (signal 10, access to undefined memory) when Slang's internal global
+      # state is accessed concurrently from multiple tests.
+      - run: cargo test --workspace -- --test-threads=1
