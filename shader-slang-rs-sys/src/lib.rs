@@ -32,6 +32,12 @@ pub const SLANG_E_NOT_FOUND: SlangResult = 0x82000005u32 as i32;
 /// emitted by bindgen for the same reason as `SLANG_FAIL`.
 pub const SLANG_E_NOT_IMPLEMENTED: SlangResult = 0x80004001u32 as i32;
 
+/// `SlangWriterMode` from slang.h (not emitted by bindgen because it lives
+/// inside the `namespace slang { ... }` block).
+pub type SlangWriterMode = u32;
+pub const SLANG_WRITER_MODE_TEXT: SlangWriterMode = 0;
+pub const SLANG_WRITER_MODE_BINARY: SlangWriterMode = 1;
+
 #[repr(C)]
 pub struct ICastableVtable {
 	pub _base: ISlangUnknown__bindgen_vtable,
@@ -305,6 +311,39 @@ pub struct IByteCodeRunnerVtable {
 	pub setPrintCallback: unsafe extern "C" fn(*mut c_void, callback: slang_VMPrintFunc, userData: *mut c_void) -> SlangResult,
 }
 
+// Note: `ISlangClonable` extends `ISlangCastable` and adds `clone` (which
+// takes a UUID and returns a `void*`). The `clone` method is declared as
+// `virtual` (not `SLANG_NO_THROW virtual`), but the vtable layout is the
+// same — the `ISlangCastableVtable` base covers the inherited methods.
+#[repr(C)]
+pub struct ISlangClonableVtable {
+	pub _base: ICastableVtable,
+
+	pub clone: unsafe extern "C" fn(*mut c_void, guid: *const SlangUUID) -> *mut c_void,
+}
+
+#[repr(C)]
+pub struct ISlangWriterVtable {
+	pub _base: ISlangUnknown__bindgen_vtable,
+
+	pub beginAppendBuffer: unsafe extern "C" fn(*mut c_void, maxNumChars: usize) -> *mut c_char,
+	pub endAppendBuffer: unsafe extern "C" fn(*mut c_void, buffer: *mut c_char, numChars: usize) -> SlangResult,
+	pub write: unsafe extern "C" fn(*mut c_void, chars: *const c_char, numChars: usize) -> SlangResult,
+	pub flush: unsafe extern "C" fn(*mut c_void),
+	pub isConsole: unsafe extern "C" fn(*mut c_void) -> SlangBool,
+	pub setMode: unsafe extern "C" fn(*mut c_void, mode: SlangWriterMode) -> SlangResult,
+}
+
+#[repr(C)]
+pub struct ISlangProfilerVtable {
+	pub _base: ISlangUnknown__bindgen_vtable,
+
+	pub getEntryCount: unsafe extern "C" fn(*mut c_void) -> usize,
+	pub getEntryName: unsafe extern "C" fn(*mut c_void, index: u32) -> *const c_char,
+	pub getEntryTimeMS: unsafe extern "C" fn(*mut c_void, index: u32) -> c_int,
+	pub getEntryInvocationTimes: unsafe extern "C" fn(*mut c_void, index: u32) -> u32,
+}
+
 // --- ABI validation ---
 //
 // The handwritten vtables above must match the interface layouts declared in
@@ -345,6 +384,9 @@ pub(crate) const ISYNTHETIC_RESOURCE_METADATA_METHODS: usize = 3;
 pub(crate) const ICOOPERATIVE_TYPES_METADATA_METHODS: usize = 8;
 pub(crate) const IMODULE_PRECOMPILE_SERVICE_EXPERIMENTAL_METHODS: usize = 4;
 pub(crate) const IBYTE_CODE_RUNNER_METHODS: usize = 11;
+pub(crate) const ISLANG_CLONABLE_METHODS: usize = 1;
+pub(crate) const ISLANG_WRITER_METHODS: usize = 6;
+pub(crate) const ISLANG_PROFILER_METHODS: usize = 4;
 
 const _: () = assert!(
     std::mem::size_of::<ISlangUnknown__bindgen_vtable>()
@@ -482,6 +524,24 @@ const _: () = assert!(
         == std::mem::size_of::<ISlangUnknown__bindgen_vtable>()
             + IBYTE_CODE_RUNNER_METHODS * std::mem::size_of::<*const c_void>(),
     "IByteCodeRunnerVtable does not match ISlangUnknown + 11 methods (slang.h)"
+);
+const _: () = assert!(
+    std::mem::size_of::<ISlangClonableVtable>()
+        == std::mem::size_of::<ICastableVtable>()
+            + ISLANG_CLONABLE_METHODS * std::mem::size_of::<*const c_void>(),
+    "ISlangClonableVtable does not match ISlangCastable + 1 method (slang.h)"
+);
+const _: () = assert!(
+    std::mem::size_of::<ISlangWriterVtable>()
+        == std::mem::size_of::<ISlangUnknown__bindgen_vtable>()
+            + ISLANG_WRITER_METHODS * std::mem::size_of::<*const c_void>(),
+    "ISlangWriterVtable does not match ISlangUnknown + 6 methods (slang.h)"
+);
+const _: () = assert!(
+    std::mem::size_of::<ISlangProfilerVtable>()
+        == std::mem::size_of::<ISlangUnknown__bindgen_vtable>()
+            + ISLANG_PROFILER_METHODS * std::mem::size_of::<*const c_void>(),
+    "ISlangProfilerVtable does not match ISlangUnknown + 4 methods (slang.h)"
 );
 
 #[cfg(test)]
@@ -634,6 +694,9 @@ mod tests {
                 IMODULE_PRECOMPILE_SERVICE_EXPERIMENTAL_METHODS,
             ),
             ("IByteCodeRunner", IBYTE_CODE_RUNNER_METHODS),
+            ("ISlangClonable", ISLANG_CLONABLE_METHODS),
+            ("ISlangWriter", ISLANG_WRITER_METHODS),
+            ("ISlangProfiler", ISLANG_PROFILER_METHODS),
         ] {
             assert_eq!(
                 count_pure_virtual_methods(&source, interface),

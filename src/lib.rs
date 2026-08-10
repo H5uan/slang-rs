@@ -211,6 +211,7 @@ pub fn build_tag_string() -> Option<&'static str> {
 /// Profile IDs are not guaranteed to be stable across versions of the Slang
 /// library, so look profiles up by name at runtime instead of hardcoding IDs.
 #[derive(Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProfileID(sys::SlangProfileID);
 
 impl ProfileID {
@@ -226,6 +227,7 @@ impl ProfileID {
 /// The internal ID of a capability, as looked up by
 /// [`GlobalSession::find_capability`] (`SlangCapabilityID` in slang.h).
 #[derive(Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CapabilityID(sys::SlangCapabilityID);
 
 impl CapabilityID {
@@ -305,6 +307,13 @@ impl Drop for IUnknown {
 		vcall!(self, ISlangUnknown_release());
 	}
 }
+
+// SAFETY: `IUnknown` wraps a COM interface pointer. COM's `AddRef`/`Release`
+// and `QueryInterface` are specified as thread-safe. Slang's own interface
+// implementations are likewise safe to use from shared `&` references.
+// Ownership of the pointer can be transferred between threads.
+unsafe impl Send for IUnknown {}
+unsafe impl Sync for IUnknown {}
 
 impl IUnknown {
 	/// Queries this object for the interface `T`, returning an owned reference
@@ -414,6 +423,125 @@ impl SharedLibrary {
 		let name = CString::new(name).unwrap();
 		let symbol = vcall!(self, findSymbolAddressByName(name.as_ptr()));
 		(!symbol.is_null()).then_some(symbol)
+	}
+}
+
+/// An owned reference to a Slang clonable object (`ISlangClonable` in slang.h),
+/// which can clone itself for any supported interface GUID.
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct Clonable(IUnknown);
+
+unsafe impl Interface for Clonable {
+	type Vtable = sys::ISlangClonableVtable;
+	const IID: UUID = uuid(0x1ec3_6168_e9f4_430d_bb17_048a_8046_b31f);
+}
+
+impl Clonable {
+	/// Clones the object for the specified interface `T` (`ISlangClonable::clone`).
+	/// Returns `None` when the object does not support the requested interface.
+	pub fn clone_as<T: Interface>(&self) -> Option<T> {
+		let object = vcall!(self, clone(&T::IID));
+		let object = std::ptr::NonNull::new(object)?;
+		// `clone` returns a non-refcounted (borrowed) pointer; take a reference
+		// so the returned wrapper owns it.
+		let object = IUnknown(object);
+		// SAFETY: the object is guaranteed by Slang to be a valid `T` pointer.
+		unsafe { (object.vtable().ISlangUnknown_addRef)(object.as_raw()) };
+		Some(unsafe { std::ptr::read(&object as *const _ as *const T) })
+	}
+}
+
+/// An owned reference to a Slang writer stream (`ISlangWriter` in slang.h),
+/// used for outputting diagnostic and other information.
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct Writer(IUnknown);
+
+unsafe impl Interface for Writer {
+	type Vtable = sys::ISlangWriterVtable;
+	const IID: UUID = uuid(0xec45_7f0e_9add_4e6b_851c_d7fa_716d_15fd);
+}
+
+impl Writer {
+	/// Begins an append buffer (`ISlangWriter::beginAppendBuffer`).
+	/// Only one append buffer can be active at a time.
+	pub fn begin_append_buffer(&self, max_num_chars: usize) -> *mut u8 {
+		vcall!(self, beginAppendBuffer(max_num_chars)) as *mut u8
+	}
+
+	/// Ends the append buffer and writes its content (`ISlangWriter::endAppendBuffer`).
+	pub fn end_append_buffer(&self, buffer: &[u8]) -> Result<()> {
+		let result = vcall!(self, endAppendBuffer(buffer.as_ptr() as *mut i8, buffer.len()));
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(())
+	}
+
+	/// Writes text to the writer (`ISlangWriter::write`).
+	pub fn write(&self, chars: &[u8]) -> Result<()> {
+		let result = vcall!(self, write(chars.as_ptr() as *const i8, chars.len()));
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(())
+	}
+
+	/// Flushes any content to the output (`ISlangWriter::flush`).
+	pub fn flush(&self) {
+		vcall!(self, flush());
+	}
+
+	/// Returns whether this writer is a console writer (`ISlangWriter::isConsole`).
+	pub fn is_console(&self) -> bool {
+		vcall!(self, isConsole())
+	}
+
+	/// Sets the mode for the writer (`ISlangWriter::setMode`).
+	pub fn set_mode(&self, mode: sys::SlangWriterMode) -> Result<()> {
+		let result = vcall!(self, setMode(mode));
+		if !succeeded(result) {
+			return Err(Error::Code(result));
+		}
+		Ok(())
+	}
+}
+
+/// An owned reference to a Slang profiler (`ISlangProfiler` in slang.h),
+/// providing performance profiling data from the compiler.
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct Profiler(IUnknown);
+
+unsafe impl Interface for Profiler {
+	type Vtable = sys::ISlangProfilerVtable;
+	const IID: UUID = uuid(0x1977_72c7_0155_4b91_84e8_6668_baff_0619);
+}
+
+impl Profiler {
+	/// Gets the number of profiling entries (`ISlangProfiler::getEntryCount`).
+	pub fn entry_count(&self) -> usize {
+		vcall!(self, getEntryCount())
+	}
+
+	/// Gets the name of the profiling entry at `index` (`ISlangProfiler::getEntryName`).
+	/// Returns `None` when the index is out of range or the name is not valid UTF-8.
+	pub fn entry_name(&self, index: u32) -> Option<&str> {
+		let name = vcall!(self, getEntryName(index));
+		unsafe { str_from_slang(name) }
+	}
+
+	/// Gets the time in milliseconds for the profiling entry at `index`
+	/// (`ISlangProfiler::getEntryTimeMS`).
+	pub fn entry_time_ms(&self, index: u32) -> i32 {
+		vcall!(self, getEntryTimeMS(index))
+	}
+
+	/// Gets the number of invocation times for the profiling entry at `index`
+	/// (`ISlangProfiler::getEntryInvocationTimes`).
+	pub fn entry_invocation_times(&self, index: u32) -> u32 {
+		vcall!(self, getEntryInvocationTimes(index))
 	}
 }
 
@@ -694,6 +822,19 @@ impl GlobalSession {
 		Some(GlobalSession(IUnknown(std::ptr::NonNull::new(
 			global_session as *mut _,
 		)?)))
+	}
+
+	/// Returns a lazily-initialized, process-wide singleton `GlobalSession`.
+	///
+	/// The session is created on first access and **never dropped**, which
+	/// avoids triggering Slang's global state cleanup at process exit (a
+	/// common source of flaky SIGBUS crashes on macOS). All callers share
+	/// the same underlying Slang `IGlobalSession` object.
+	///
+	/// Panics if Slang fails to create the global session.
+	pub fn global() -> &'static GlobalSession {
+		static GLOBAL: std::sync::OnceLock<GlobalSession> = std::sync::OnceLock::new();
+		GLOBAL.get_or_init(|| GlobalSession::new().expect("GlobalSession::new failed"))
 	}
 
 	/// Creates a new session for loading and compiling code
@@ -2085,6 +2226,7 @@ pub struct CoverageEntryInfo<'a> {
 /// [`CoverageTracingMetadata::buffer_info`] (`slang::CoverageBufferInfo` in
 /// slang.h, minus the leading `structSize` ABI field). A `-1` sentinel means
 /// the value is not reported for the current target.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CoverageBufferInfo {
 	/// Register space the coverage buffer is bound to (D3D12 `space`, Vulkan
 	/// descriptor set), or -1 if not assigned for this target.

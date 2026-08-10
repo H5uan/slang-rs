@@ -42,10 +42,21 @@ fn compile() {
 	assert_ne!(shader_bytecode.as_slice().len(), 0);
 }
 
+/// A cached global session that is never dropped, to avoid triggering Slang's
+/// global state cleanup on macOS (which can cause a flaky SIGBUS during
+/// process exit).
+///
+/// Using `OnceLock` + `&*` ensures the value lives for the entire process
+/// lifetime and is never destroyed.
+fn global_session() -> &'static slang::GlobalSession {
+	static GLOBAL_SESSION: std::sync::OnceLock<slang::GlobalSession> = std::sync::OnceLock::new();
+	GLOBAL_SESSION.get_or_init(|| slang::GlobalSession::new().expect("GlobalSession::new failed"))
+}
+
 /// Creates a session with a SPIR-V target and the `shaders/` search path,
 /// shared by the tests below.
 fn create_test_session() -> slang::Session {
-	let global_session = slang::GlobalSession::new().unwrap();
+	let global_session = global_session();
 
 	let search_path = std::ffi::CString::new("shaders").unwrap();
 

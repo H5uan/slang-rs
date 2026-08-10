@@ -16,9 +16,10 @@ exclude = ["slang/", "target/", "AGENTS.md"]
 
 [dependencies]
 shader-slang-rs-sys = { path = "shader-slang-rs-sys", version = "0.2.0" }
+serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
-serde = ["shader-slang-rs-sys/serde"]
+serde = ["dep:serde", "shader-slang-rs-sys/serde"]
 source-build = ["shader-slang-rs-sys/source-build"]
 
 [workspace]

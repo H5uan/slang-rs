@@ -370,6 +370,15 @@ impl bindgen::callbacks::ParseCallbacks for ParseCallback {
 		if info.name.starts_with("Slang") && info.kind == bindgen::callbacks::TypeKind::Enum {
 			return vec!["serde::Serialize".into(), "serde::Deserialize".into()];
 		}
+
+		// All-scalar structs used in the public high-level API.
+		if matches!(
+			info.name.as_ref(),
+			"slang_ByteCodeFuncInfo" | "slang_CoverageBufferInfo"
+		) {
+			return vec!["serde::Serialize".into(), "serde::Deserialize".into()];
+		}
+
 		vec![]
 	}
 }
