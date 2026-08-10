@@ -10,10 +10,34 @@ fn main() {
 	divan::main();
 }
 
-/// A shared GlobalSession used across all benchmarks.
+/// A shared GlobalSession used across all benchmarks. `GlobalSession` is
+/// deliberately `!Sync`, so it cannot live in a `'static` static directly; the
+/// session is leaked and its address stored behind a `Send + Sync` holder.
+/// Benchmarks run single-threaded via `bench_local`, and the shared session is
+/// only touched from setup code on the bench's own thread.
 fn global_session() -> &'static slang::GlobalSession {
-	static GS: std::sync::OnceLock<slang::GlobalSession> = std::sync::OnceLock::new();
-	GS.get_or_init(|| slang::GlobalSession::new().expect("GlobalSession::new failed"))
+	static GS: std::sync::OnceLock<LeakedGlobalSession> = std::sync::OnceLock::new();
+	GS.get_or_init(|| {
+		let session = slang::GlobalSession::new().expect("GlobalSession::new failed");
+		LeakedGlobalSession(Box::leak(Box::new(session)) as *const slang::GlobalSession)
+	})
+	.as_ref()
+}
+
+/// Holds a leaked `&'static` `GlobalSession` address for [`global_session`].
+struct LeakedGlobalSession(*const slang::GlobalSession);
+
+// SAFETY: the leaked session is only dereferenced from the benchmark's own
+// (single) thread, never concurrently.
+unsafe impl Send for LeakedGlobalSession {}
+unsafe impl Sync for LeakedGlobalSession {}
+
+impl LeakedGlobalSession {
+	fn as_ref(&self) -> &'static slang::GlobalSession {
+		// SAFETY: the pointer is non-null and to a `Box::leak`ed session that
+		// outlives the process.
+		unsafe { &*self.0 }
+	}
 }
 
 /// Benchmark: create a GlobalSession.
@@ -42,7 +66,7 @@ fn create_session() -> slang::Session {
 #[divan::bench]
 fn load_module(bencher: Bencher) {
 	let session = create_session();
-	bencher.bench(|| {
+	bencher.bench_local(|| {
 		let _module = session.load_module("test.slang");
 	});
 }
@@ -51,7 +75,7 @@ fn load_module(bencher: Bencher) {
 #[divan::bench]
 fn full_compile(bencher: Bencher) {
 	let session = create_session();
-	bencher.bench(|| {
+	bencher.bench_local(|| {
 		let module = session.load_module("test.slang").unwrap();
 		let entry_point = module.find_entry_point_by_name("main").unwrap();
 		let program = session
@@ -72,7 +96,7 @@ fn get_layout(bencher: Bencher) {
 		.create_composite_component_type(&[module.into(), entry_point.into()])
 		.unwrap();
 	let linked = program.link().unwrap();
-	bencher.bench(|| {
+	bencher.bench_local(|| {
 		let _layout = linked.layout(0);
 	});
 }
@@ -82,7 +106,7 @@ fn get_layout(bencher: Bencher) {
 fn serialize_module(bencher: Bencher) {
 	let session = create_session();
 	let module = session.load_module("test.slang").unwrap();
-	bencher.bench(|| {
+	bencher.bench_local(|| {
 		let _blob = module.serialize().unwrap();
 	});
 }
@@ -129,7 +153,7 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID) {
 		.create_composite_component_type(&[module.into(), entry_point.into()])
 		.unwrap();
 
-	bencher.bench(|| {
+	bencher.bench_local(|| {
 		let _lib = program.entry_point_host_callable(0, 0).unwrap();
 	});
 }

@@ -308,12 +308,19 @@ impl Drop for IUnknown {
 	}
 }
 
-// SAFETY: `IUnknown` wraps a COM interface pointer. COM's `AddRef`/`Release`
-// and `QueryInterface` are specified as thread-safe. Slang's own interface
-// implementations are likewise safe to use from shared `&` references.
-// Ownership of the pointer can be transferred between threads.
-unsafe impl Send for IUnknown {}
-unsafe impl Sync for IUnknown {}
+// NOTE: `IUnknown` deliberately implements neither `Send` nor `Sync`.
+//
+// COM's `AddRef`/`Release` refcounting is thread-safe, so a *single* COM
+// reference could in principle be moved between threads. But Slang does not
+// make its interfaces safe to share or to call concurrently: slang.h states
+// that "a global session and the objects created from it" (i.e. sessions,
+// modules, component types, ...) "are not thread-safe" and "should be
+// externally synchronized when shared across threads". Because `Clone` can
+// produce several independent wrappers around the same underlying COM
+// object, marking the base `Send` would let those clones be moved to
+// different threads and called concurrently — a data race the type system
+// would not catch. So the base is `!Send + !Sync`, and only the genuinely
+// immutable, read-only wrappers ([`Blob`], [`Metadata`]) opt back in below.
 
 impl IUnknown {
 	/// Queries this object for the interface `T`, returning an owned reference
@@ -365,6 +372,13 @@ unsafe impl Interface for Blob {
 	type Vtable = sys::IBlobVtable;
 	const IID: UUID = uuid(0x8ba5_fb08_5195_40e2_ac58_0d98_9c3a_0102);
 }
+
+// SAFETY: an `ISlangBlob` is an immutable byte buffer; `getBufferPointer`/
+// `getBufferSize` are read-only and safe to call from any thread. Moving a
+// blob to another thread (or sharing it via `Arc`) does not race with any
+// mutation, so `Blob` is both `Send` and `Sync`.
+unsafe impl Send for Blob {}
+unsafe impl Sync for Blob {}
 
 impl Blob {
 	/// Creates a Slang blob owning a copy of `data` (`slang_createBlob`).
@@ -825,19 +839,6 @@ impl GlobalSession {
 		Some(GlobalSession(IUnknown(std::ptr::NonNull::new(
 			global_session as *mut _,
 		)?)))
-	}
-
-	/// Returns a lazily-initialized, process-wide singleton `GlobalSession`.
-	///
-	/// The session is created on first access and **never dropped**, which
-	/// avoids triggering Slang's global state cleanup at process exit (a
-	/// common source of flaky SIGBUS crashes on macOS). All callers share
-	/// the same underlying Slang `IGlobalSession` object.
-	///
-	/// Panics if Slang fails to create the global session.
-	pub fn global() -> &'static GlobalSession {
-		static GLOBAL: std::sync::OnceLock<GlobalSession> = std::sync::OnceLock::new();
-		GLOBAL.get_or_init(|| GlobalSession::new().expect("GlobalSession::new failed"))
 	}
 
 	/// Creates a new session for loading and compiling code
@@ -1882,6 +1883,14 @@ unsafe impl Interface for Metadata {
 	type Vtable = sys::IMetadataVtable;
 	const IID: UUID = uuid(0x8044_a8a3_ddc0_4b7f_af8e_026e_905d_7332);
 }
+
+// SAFETY: slang.h states that metadata objects "are immutable once returned
+// to the host; concurrent read-only queries are allowed as long as callers
+// keep the owning COM object alive". The wrapper holds an owned reference
+// (keeping the COM object alive), and all `Metadata` methods are read-only,
+// so it is safe to share across threads.
+unsafe impl Send for Metadata {}
+unsafe impl Sync for Metadata {}
 
 impl Metadata {
 	/// Casts this object to another interface using Slang's `ISlangCastable`

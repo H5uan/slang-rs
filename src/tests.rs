@@ -44,13 +44,42 @@ fn compile() {
 
 /// A cached global session that is never dropped, to avoid triggering Slang's
 /// global state cleanup on macOS (which can cause a flaky SIGBUS during
-/// process exit).
+/// process exit). The session is `Box::leak`ed so it lives for the entire
+/// process and is never destroyed.
 ///
-/// Using `OnceLock` + `&*` ensures the value lives for the entire process
-/// lifetime and is never destroyed.
+/// `GlobalSession` is deliberately `!Sync` (Slang's global session is not
+/// thread-safe), so the cached value cannot be stored in a static directly.
+/// The helper instead leaks the session and stores its address behind a
+/// `Send + Sync` holder. This is sound only because tests run single-threaded
+/// (`--test-threads=1`) and no test ever calls methods on this shared session
+/// from more than one thread concurrently — the parallel-compile test creates
+/// its own per-thread sessions instead.
 fn global_session() -> &'static slang::GlobalSession {
-	static GLOBAL_SESSION: std::sync::OnceLock<slang::GlobalSession> = std::sync::OnceLock::new();
-	GLOBAL_SESSION.get_or_init(|| slang::GlobalSession::new().expect("GlobalSession::new failed"))
+	static GLOBAL_SESSION: std::sync::OnceLock<LeakedGlobalSession> = std::sync::OnceLock::new();
+	GLOBAL_SESSION
+		.get_or_init(|| {
+			let session = slang::GlobalSession::new().expect("GlobalSession::new failed");
+			LeakedGlobalSession(Box::leak(Box::new(session)) as *const slang::GlobalSession)
+		})
+		.as_ref()
+}
+
+/// Holds a leaked `&'static` `GlobalSession` address. Only used by
+/// [`global_session`] to keep a process-lifetime session without a `Sync`
+/// static; see that function's safety note.
+struct LeakedGlobalSession(*const slang::GlobalSession);
+
+// SAFETY: upheld by the `global_session()` helper docs — the leaked session is
+// only ever touched from a single thread at a time in the test suite.
+unsafe impl Send for LeakedGlobalSession {}
+unsafe impl Sync for LeakedGlobalSession {}
+
+impl LeakedGlobalSession {
+	fn as_ref(&self) -> &'static slang::GlobalSession {
+		// SAFETY: the pointer is non-null and to a `Box::leak`ed session that
+		// lives for the whole process.
+		unsafe { &*self.0 }
+	}
 }
 
 /// Creates a session with a SPIR-V target and the `shaders/` search path,
@@ -2166,4 +2195,74 @@ fn spirv_validation() {
 		(0x10000..=0x10600).contains(&version),
 		"unexpected SPIR-V version: 0x{version:08x}",
 	);
+}
+
+// ---------------------------------------------------------------------------
+// Thread-safety soundness tests
+//
+// The binding deliberately marks `IUnknown` as neither `Send` nor `Sync`
+// (Slang documents that "a global session and the objects created from it"
+// are not thread-safe). Only the genuinely immutable, read-only wrappers
+// [`Blob`] and [`Metadata`] opt back in. These tests lock in that contract.
+// ---------------------------------------------------------------------------
+
+/// Compile-time assertion that `T` is both `Send` and `Sync`. Calling this
+/// with a type that is not `Send + Sync` is a compile error.
+fn assert_send_sync<T: Send + Sync>() {}
+
+#[test]
+fn thread_safety_immutable_wrappers_are_send_sync() {
+	// `Blob` (immutable byte buffer) and `Metadata` (immutable once returned)
+	// are the two wrappers Slang explicitly documents as safe for concurrent
+	// read-only use. Asserting these bounds here means an accidental
+	// re-narrowing fails to compile.
+	assert_send_sync::<slang::Blob>();
+	assert_send_sync::<slang::Metadata>();
+	assert_send_sync::<slang::Error>();
+}
+
+#[test]
+fn thread_safety_concurrent_sessions_compile_in_parallel() {
+	// Slang's documented contract: "Distinct global sessions may be used from
+	// different threads in parallel." Each thread builds its own session (it
+	// must, because a session is `!Send`/`!Sync`) and compiles the same shader.
+	// The compiled `Blob` results are `Send + Sync`, so they can be collected
+	// back onto the spawning thread and validated.
+	const THREADS: usize = 4;
+	let results: Vec<slang::Blob> = std::thread::scope(|scope| {
+		let handles: Vec<_> = (0..THREADS)
+			.map(|_| {
+				scope.spawn(|| {
+					let global_session = slang::GlobalSession::new().unwrap();
+					let search_path = std::ffi::CString::new("shaders").unwrap();
+					let target_desc = slang::TargetDesc::default()
+						.format(slang::CompileTarget::Spirv)
+						.profile(global_session.find_profile("glsl_450"));
+					let targets = [target_desc];
+					let search_paths = [search_path.as_ptr()];
+					let session_desc = slang::SessionDesc::default()
+						.targets(&targets)
+						.search_paths(&search_paths);
+					let session = global_session.create_session(&session_desc).unwrap();
+					let module = session.load_module("test.slang").unwrap();
+					let entry_point = module.find_entry_point_by_name("main").unwrap();
+					let program = session
+						.create_composite_component_type(&[module.into(), entry_point.into()])
+						.unwrap();
+					let linked = program.link().unwrap();
+					linked.entry_point_code(0, 0).unwrap()
+				})
+			})
+			.collect();
+		handles
+			.into_iter()
+			.map(|h| h.join().expect("thread panicked"))
+			.collect()
+	});
+
+	for code in results {
+		let magic = u32::from_le_bytes(code.as_slice()[..4].try_into().unwrap());
+		assert_eq!(magic, 0x07230203, "bad SPIR-V magic");
+		assert_ne!(code.as_slice().len(), 0);
+	}
 }
