@@ -1959,7 +1959,10 @@ fn multi_target_compilation() {
 	assert_eq!(magic, 0x07230203, "not valid SPIR-V");
 
 	// Target 1: DXIL (if supported on this platform)
-	if gs.check_compile_target_support(slang::CompileTarget::Dxil).is_ok() {
+	if gs
+		.check_compile_target_support(slang::CompileTarget::Dxil)
+		.is_ok()
+	{
 		let dxil_code = linked_program.entry_point_code(0, 1).unwrap();
 		assert!(!dxil_code.as_slice().is_empty());
 		// DXIL starts with a DXBC header ("DXBC" magic).
@@ -1992,18 +1995,15 @@ float4 fragmentMain(VertexOutput input) : SV_Target { return input.position; }
 
 	let ep_vertex = module.find_entry_point_by_name("vertexMain").unwrap();
 	let ep_fragment = module.find_entry_point_by_name("fragmentMain").unwrap();
-	let ep_names: Vec<_> = module.entry_points().map(|ep| {
-		ep.function_reflection().name().unwrap_or("?").to_string()
-	}).collect();
+	let ep_names: Vec<_> = module
+		.entry_points()
+		.map(|ep| ep.function_reflection().name().unwrap_or("?").to_string())
+		.collect();
 	assert_eq!(ep_names, ["vertexMain", "fragmentMain"]);
 
 	// Compile both entry points together.
 	let program = session
-		.create_composite_component_type(&[
-			module.into(),
-			ep_vertex.into(),
-			ep_fragment.into(),
-		])
+		.create_composite_component_type(&[module.into(), ep_vertex.into(), ep_fragment.into()])
 		.unwrap();
 	let linked_program = program.link().unwrap();
 	let code_v = linked_program.entry_point_code(0, 0).unwrap();
@@ -2100,7 +2100,9 @@ fn container_type_and_specialize() {
 	let ty = param.ty().unwrap();
 
 	// Wrap the scalar type in a container: UnsizedArray<int>.
-	let element_ty = session.container_type(ty, slang::ContainerType::UnsizedArray).unwrap();
+	let element_ty = session
+		.container_type(ty, slang::ContainerType::UnsizedArray)
+		.unwrap();
 	assert_eq!(element_ty.kind(), slang::TypeKind::Array);
 	assert_eq!(element_ty.element_count(), 0); // unsized
 

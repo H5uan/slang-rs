@@ -472,7 +472,10 @@ impl Writer {
 
 	/// Ends the append buffer and writes its content (`ISlangWriter::endAppendBuffer`).
 	pub fn end_append_buffer(&self, buffer: &[u8]) -> Result<()> {
-		let result = vcall!(self, endAppendBuffer(buffer.as_ptr() as *mut i8, buffer.len()));
+		let result = vcall!(
+			self,
+			endAppendBuffer(buffer.as_ptr() as *mut i8, buffer.len())
+		);
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}

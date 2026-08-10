@@ -105,8 +105,7 @@ fn host_callable_compile(bencher: Bencher) {
 		return;
 	}
 
-	let target_desc = slang::TargetDesc::default()
-		.format(slang::CompileTarget::ShaderHostCallable);
+	let target_desc = slang::TargetDesc::default().format(slang::CompileTarget::ShaderHostCallable);
 	let targets = [target_desc];
 	let session_desc = slang::SessionDesc::default().targets(&targets);
 	let session = gs.create_session(&session_desc).unwrap();
