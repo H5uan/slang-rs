@@ -155,6 +155,14 @@ pub(crate) fn succeeded(result: sys::SlangResult) -> bool {
 	result >= 0
 }
 
+/// Converts a `&str` into a NUL-terminated `CString`, returning
+/// [`Error::Code`]`(SLANG_E_INVALID_ARG)` when `input` contains an interior
+/// NUL byte (which cannot be represented in a C string). This lets public
+/// methods reject malformed input with an error instead of panicking.
+fn cstring(input: &str) -> Result<std::ffi::CString> {
+	std::ffi::CString::new(input).map_err(|_| Error::Code(sys::SLANG_E_INVALID_ARG))
+}
+
 fn result_from_blob(code: sys::SlangResult, blob: *mut sys::slang_IBlob) -> Result<()> {
 	// Take ownership of the diagnostics blob regardless of the result: Slang
 	// may hand back a non-null blob even on success (warnings), and it must
@@ -434,7 +442,8 @@ impl SharedLibrary {
 	/// `SharedLibrary` is alive; interpreting it (e.g. casting to a function
 	/// pointer with the correct ABI) is up to the caller.
 	pub fn find_symbol(&self, name: &str) -> Option<*mut std::ffi::c_void> {
-		let name = CString::new(name).unwrap();
+		// An interior NUL cannot be a symbol name; treat it as "not found".
+		let name = CString::new(name).ok()?;
 		let symbol = vcall!(self, findSymbolAddressByName(name.as_ptr()));
 		(!symbol.is_null()).then_some(symbol)
 	}
@@ -585,7 +594,7 @@ impl MutableFileSystem {
 	/// Loads the file at `path` and returns its exact bytes
 	/// (`ISlangFileSystem::loadFile`).
 	pub fn load_file(&self, path: &str) -> Result<Blob> {
-		let path = CString::new(path).unwrap();
+		let path = cstring(path)?;
 		let mut blob = null_mut();
 		let result = vcall!(self, _base._base, loadFile(path.as_ptr(), &mut blob));
 		// `loadFile` takes no diagnostics out-pointer; the result code is the
@@ -603,7 +612,7 @@ impl MutableFileSystem {
 	/// report the same identity when their contents are identical; Slang uses
 	/// the identity for source caching and `#pragma once`.
 	pub fn file_unique_identity(&self, path: &str) -> Result<Blob> {
-		let path = CString::new(path).unwrap();
+		let path = cstring(path)?;
 		let mut identity = null_mut();
 		let result = vcall!(
 			self,
@@ -628,8 +637,8 @@ impl MutableFileSystem {
 		from_path: &str,
 		path: &str,
 	) -> Result<Blob> {
-		let from_path = CString::new(from_path).unwrap();
-		let path = CString::new(path).unwrap();
+		let from_path = cstring(from_path)?;
+		let path = cstring(path)?;
 		let mut combined = null_mut();
 		let result = vcall!(
 			self,
@@ -653,7 +662,7 @@ impl MutableFileSystem {
 	/// (`ISlangFileSystemExt::getPathType`). Returns `Err` when the path does
 	/// not exist on this file system.
 	pub fn path_type(&self, path: &str) -> Result<PathType> {
-		let path = CString::new(path).unwrap();
+		let path = cstring(path)?;
 		let mut path_type = PathType::File;
 		let result = vcall!(self, _base, getPathType(path.as_ptr(), &mut path_type));
 		if !succeeded(result) {
@@ -666,7 +675,7 @@ impl MutableFileSystem {
 	/// (`ISlangFileSystemExt::getPath`), e.g. simplified or canonicalized.
 	/// Returns `Err` when the file system does not support the conversion.
 	pub fn get_path(&self, kind: PathKind, path: &str) -> Result<Blob> {
-		let path = CString::new(path).unwrap();
+		let path = cstring(path)?;
 		let mut out_path = null_mut();
 		let result = vcall!(self, _base, getPath(kind, path.as_ptr(), &mut out_path));
 		if !succeeded(result) {
@@ -697,7 +706,7 @@ impl MutableFileSystem {
 		path: &str,
 		callback: impl FnMut(PathType, &str),
 	) -> Result<()> {
-		let path = CString::new(path).unwrap();
+		let path = cstring(path)?;
 		let mut callback = callback;
 		let mut callback: &mut dyn FnMut(PathType, &str) = &mut callback;
 
@@ -743,7 +752,7 @@ impl MutableFileSystem {
 	/// Writes `data` to `path` (`ISlangMutableFileSystem::saveFile`),
 	/// replacing any existing file.
 	pub fn save_file(&self, path: &str, data: &[u8]) -> Result<()> {
-		let path = CString::new(path).unwrap();
+		let path = cstring(path)?;
 		let result = vcall!(
 			self,
 			saveFile(path.as_ptr(), data.as_ptr() as *const c_void, data.len())
@@ -759,7 +768,7 @@ impl MutableFileSystem {
 	/// implementation this can be cheaper than [`MutableFileSystem::save_file`];
 	/// the blob is treated as immutable.
 	pub fn save_file_blob(&self, path: &str, data: &Blob) -> Result<()> {
-		let path = CString::new(path).unwrap();
+		let path = cstring(path)?;
 		let result = vcall!(self, saveFileBlob(path.as_ptr(), data.as_raw()));
 		if !succeeded(result) {
 			return Err(Error::Code(result));
@@ -770,7 +779,7 @@ impl MutableFileSystem {
 	/// Removes the file or empty directory at `path`
 	/// (`ISlangMutableFileSystem::remove`).
 	pub fn remove(&self, path: &str) -> Result<()> {
-		let path = CString::new(path).unwrap();
+		let path = cstring(path)?;
 		let result = vcall!(self, remove(path.as_ptr()));
 		if !succeeded(result) {
 			return Err(Error::Code(result));
@@ -782,7 +791,7 @@ impl MutableFileSystem {
 	/// (`ISlangMutableFileSystem::createDirectory`). The parent path must
 	/// exist.
 	pub fn create_directory(&self, path: &str) -> Result<()> {
-		let path = CString::new(path).unwrap();
+		let path = cstring(path)?;
 		let result = vcall!(self, createDirectory(path.as_ptr()));
 		if !succeeded(result) {
 			return Err(Error::Code(result));
@@ -856,7 +865,10 @@ impl GlobalSession {
 	/// (`IGlobalSession::findProfile`). Returns [`ProfileID::UNKNOWN`] when no
 	/// profile with that name exists.
 	pub fn find_profile(&self, name: &str) -> ProfileID {
-		let name = CString::new(name).unwrap();
+		// An interior NUL cannot be a profile name; fall back to UNKNOWN.
+		let Ok(name) = CString::new(name) else {
+			return ProfileID::UNKNOWN;
+		};
 		ProfileID(vcall!(self, findProfile(name.as_ptr())))
 	}
 
@@ -864,7 +876,10 @@ impl GlobalSession {
 	/// (`IGlobalSession::findCapability`). Returns [`CapabilityID::UNKNOWN`]
 	/// when no capability with that name exists.
 	pub fn find_capability(&self, name: &str) -> CapabilityID {
-		let name = CString::new(name).unwrap();
+		// An interior NUL cannot be a capability name; fall back to UNKNOWN.
+		let Ok(name) = CString::new(name) else {
+			return CapabilityID::UNKNOWN;
+		};
 		CapabilityID(vcall!(self, findCapability(name.as_ptr())))
 	}
 
@@ -882,20 +897,30 @@ impl GlobalSession {
 	/// looked up from. For back ends that are dlls/shared libraries, the path
 	/// is prefixed when calling into the shared library loader; for
 	/// executables, they are looked up along the path.
-	pub fn set_downstream_compiler_path(&self, pass_through: PassThrough, path: &str) {
-		let path = CString::new(path).unwrap();
+	pub fn set_downstream_compiler_path(
+		&self,
+		pass_through: PassThrough,
+		path: &str,
+	) -> Result<()> {
+		let path = cstring(path)?;
 		vcall!(self, setDownstreamCompilerPath(pass_through, path.as_ptr()));
+		Ok(())
 	}
 
 	/// Sets the prelude text that is pre-pended verbatim before generated
 	/// source code for `source_language`. Preludes apply to code generation
 	/// only, not to pass-through usage.
-	pub fn set_language_prelude(&self, source_language: SourceLanguage, prelude_text: &str) {
-		let prelude_text = CString::new(prelude_text).unwrap();
+	pub fn set_language_prelude(
+		&self,
+		source_language: SourceLanguage,
+		prelude_text: &str,
+	) -> Result<()> {
+		let prelude_text = cstring(prelude_text)?;
 		vcall!(
 			self,
 			setLanguagePrelude(source_language, prelude_text.as_ptr())
 		);
+		Ok(())
 	}
 
 	/// Gets the prelude associated with `source_language`, if any.
@@ -992,7 +1017,7 @@ impl GlobalSession {
 	/// Specifies a `spirv.core.grammar.json` file to load and use when parsing
 	/// and checking any SPIR-V code.
 	pub fn set_spirv_core_grammar(&self, json_path: &str) -> Result<()> {
-		let json_path = CString::new(json_path).unwrap();
+		let json_path = cstring(json_path)?;
 		let result = vcall!(self, setSPIRVCoreGrammar(json_path.as_ptr()));
 		// `setSPIRVCoreGrammar` takes no diagnostics out-pointer; the result
 		// code is the only signal.
@@ -1006,7 +1031,7 @@ impl GlobalSession {
 	/// be used to create a session with all the specified compiler options.
 	pub fn parse_command_line_arguments(&self, args: &[&str]) -> Result<ParsedCommandLine> {
 		let arg_strings: Vec<CString> =
-			args.iter().map(|arg| CString::new(*arg).unwrap()).collect();
+			args.iter().map(|arg| cstring(arg)).collect::<Result<_>>()?;
 		let argv: Vec<*const i8> = arg_strings.iter().map(|arg| arg.as_ptr()).collect();
 
 		let mut desc = SessionDesc::default();
@@ -1049,13 +1074,14 @@ impl GlobalSession {
 	/// Adds new builtin declarations, given as Slang source, to be used in
 	/// subsequent compiles on sessions created from this global session
 	/// (`IGlobalSession::addBuiltins`). `source_path` is used for diagnostics.
-	pub fn add_builtins(&self, source_path: &str, source_string: &str) {
-		let source_path = CString::new(source_path).unwrap();
-		let source_string = CString::new(source_string).unwrap();
+	pub fn add_builtins(&self, source_path: &str, source_string: &str) -> Result<()> {
+		let source_path = cstring(source_path)?;
+		let source_string = cstring(source_string)?;
 		vcall!(
 			self,
 			addBuiltins(source_path.as_ptr(), source_string.as_ptr())
 		);
+		Ok(())
 	}
 
 	/// Sets the default downstream compiler for a source language
@@ -1247,16 +1273,16 @@ impl SpecializationArg {
 
 	/// Specialize to an expression in Slang syntax (a type or a value), e.g.
 	/// `"float"` or `"3"`.
-	pub fn from_expr(expr: &str) -> Self {
-		let expr = CString::new(expr).unwrap();
+	pub fn from_expr(expr: &str) -> Result<Self> {
+		let expr = cstring(expr)?;
 		let expr_ptr = expr.as_ptr();
-		Self {
+		Ok(Self {
 			inner: sys::slang_SpecializationArg {
 				kind: sys::slang_SpecializationArg_Kind::Expr,
 				__bindgen_anon_1: sys::slang_SpecializationArg__bindgen_ty_1 { expr: expr_ptr },
 			},
 			_expr: Some(expr),
-		}
+		})
 	}
 }
 
@@ -1287,7 +1313,7 @@ impl Session {
 	/// or fails to compile; the error carries the compiler diagnostics blob
 	/// when Slang produced one.
 	pub fn load_module(&self, name: &str) -> Result<Module> {
-		let name = CString::new(name).unwrap();
+		let name = cstring(name)?;
 		let mut diagnostics = null_mut();
 
 		let module = vcall!(self, loadModule(name.as_ptr(), &mut diagnostics));
@@ -1323,9 +1349,9 @@ impl Session {
 		path: &str,
 		source: &str,
 	) -> Result<Module> {
-		let module_name = CString::new(module_name).unwrap();
-		let path = CString::new(path).unwrap();
-		let source = CString::new(source).unwrap();
+		let module_name = cstring(module_name)?;
+		let path = cstring(path)?;
+		let source = cstring(source)?;
 		let mut diagnostics = null_mut();
 
 		let module = vcall!(
@@ -1371,8 +1397,8 @@ impl Session {
 		path: &str,
 		source: &Blob,
 	) -> Result<Module> {
-		let module_name = CString::new(module_name).unwrap();
-		let path = CString::new(path).unwrap();
+		let module_name = cstring(module_name)?;
+		let path = cstring(path)?;
 		let mut diagnostics = null_mut();
 
 		let module = vcall!(
@@ -1415,8 +1441,8 @@ impl Session {
 		path: &str,
 		ir_blob: &Blob,
 	) -> Result<Module> {
-		let module_name = CString::new(module_name).unwrap();
-		let path = CString::new(path).unwrap();
+		let module_name = cstring(module_name)?;
+		let path = cstring(path)?;
 		let mut diagnostics = null_mut();
 
 		let module = vcall!(
@@ -1770,7 +1796,10 @@ impl Session {
 	/// exact staleness rules (e.g. modules whose primary source file cannot be
 	/// located on the search paths are treated as up-to-date).
 	pub fn is_binary_module_up_to_date(&self, module_path: &str, binary_module: &Blob) -> bool {
-		let module_path = CString::new(module_path).unwrap();
+		// An interior NUL means the path cannot match a real file; treat as stale.
+		let Ok(module_path) = CString::new(module_path) else {
+			return false;
+		};
 		vcall!(
 			self,
 			isBinaryModuleUpToDate(module_path.as_ptr(), binary_module.as_raw())
@@ -2576,7 +2605,7 @@ impl ComponentType {
 	/// This component type must be a single entry point, or a composite or
 	/// specialized component type that contains one entry point component.
 	pub fn rename_entry_point(&self, new_name: &str) -> Result<ComponentType> {
-		let new_name = CString::new(new_name).unwrap();
+		let new_name = cstring(new_name)?;
 		let mut entry_point = null_mut();
 
 		let result = vcall!(self, renameEntryPoint(new_name.as_ptr(), &mut entry_point));
@@ -2884,7 +2913,8 @@ impl Module {
 	/// a `[shader("...")]` attribute; use [`Module::find_and_check_entry_point`]
 	/// otherwise.
 	pub fn find_entry_point_by_name(&self, name: &str) -> Option<EntryPoint> {
-		let name = CString::new(name).unwrap();
+		// An interior NUL cannot be an entry point name; treat as not found.
+		let name = CString::new(name).ok()?;
 		let mut entry_point = null_mut();
 		vcall!(self, findEntryPointByName(name.as_ptr(), &mut entry_point));
 		Some(EntryPoint(IUnknown(std::ptr::NonNull::new(
@@ -2988,7 +3018,7 @@ impl Module {
 
 	/// Writes the serialized representation of this module to a file.
 	pub fn write_to_file(&self, file_name: &str) -> Result<()> {
-		let file_name = CString::new(file_name).unwrap();
+		let file_name = cstring(file_name)?;
 		let result = vcall!(self, writeToFile(file_name.as_ptr()));
 		// `writeToFile` takes no diagnostics out-pointer; the result code is
 		// the only error signal.
@@ -3001,7 +3031,7 @@ impl Module {
 	/// Finds and validates an entry point by name, even if the function is not
 	/// marked with the `[shader("...")]` attribute.
 	pub fn find_and_check_entry_point(&self, name: &str, stage: Stage) -> Result<EntryPoint> {
-		let name = CString::new(name).unwrap();
+		let name = cstring(name)?;
 		let mut entry_point = null_mut();
 		let mut diagnostics = null_mut();
 
@@ -3224,7 +3254,10 @@ impl ByteCodeRunner {
 		if !self.module_loaded.load(Ordering::Acquire) {
 			return -1;
 		}
-		let name = CString::new(name).unwrap();
+		// An interior NUL cannot be a function name; treat as not found.
+		let Ok(name) = CString::new(name) else {
+			return -1;
+		};
 		vcall!(self.inner, findFunctionByName(name.as_ptr()))
 	}
 
@@ -3377,17 +3410,17 @@ pub struct PreprocessorMacroDesc {
 
 impl PreprocessorMacroDesc {
 	/// Creates a preprocessor macro definition `name=value`.
-	pub fn new(name: &str, value: &str) -> Self {
-		let name = CString::new(name).unwrap();
-		let value = CString::new(value).unwrap();
-		Self {
+	pub fn new(name: &str, value: &str) -> Result<Self> {
+		let name = cstring(name)?;
+		let value = cstring(value)?;
+		Ok(Self {
 			inner: sys::slang_PreprocessorMacroDesc {
 				name: name.as_ptr(),
 				value: value.as_ptr(),
 			},
 			_name: name,
 			_value: value,
-		}
+		})
 	}
 }
 
@@ -3574,6 +3607,11 @@ impl CompilerOptions {
 		self
 	}
 
+	// NOTE: these string builders deliberately keep `unwrap` (rather than
+	// returning `Result`) so the `CompilerOptions` builder stays chainable
+	// (`.include(a).macro_define(b)...`). Option strings such as include paths
+	// and macro values are programmer-supplied and effectively never contain an
+	// interior NUL.
 	fn push_str1(mut self, name: CompilerOptionName, s0: &str) -> Self {
 		let s0 = CString::new(s0).unwrap();
 		let s0_ptr = s0.as_ptr();

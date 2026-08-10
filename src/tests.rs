@@ -453,7 +453,7 @@ void main(RWStructuredBuffer<T> output, uint3 thread_id : SV_DispatchThreadID)
 
 	// Specializing with `float` resolves the buffer element type.
 	let specialized = program
-		.specialize(&[slang::SpecializationArg::from_expr("float")])
+		.specialize(&[slang::SpecializationArg::from_expr("float").unwrap()])
 		.unwrap();
 	assert_eq!(specialized.specialization_param_count(), 0);
 
@@ -738,7 +738,7 @@ fn session_desc_preprocessor_macros() {
 
 	let target_desc = slang::TargetDesc::default().format(slang::CompileTarget::Spirv);
 	let targets = [target_desc];
-	let macros = [slang::PreprocessorMacroDesc::new("M3B_WITH_OUTPUT", "1")];
+	let macros = [slang::PreprocessorMacroDesc::new("M3B_WITH_OUTPUT", "1").unwrap()];
 	let session_desc = slang::SessionDesc::default()
 		.targets(&targets)
 		.preprocessor_macros(&macros);
@@ -1784,10 +1784,12 @@ fn load_module_from_source_blob() {
 #[test]
 fn global_session_add_builtins() {
 	let global_session = slang::GlobalSession::new().unwrap();
-	global_session.add_builtins(
-		"m7c_builtin.slang",
-		"public int m7cBuiltinValue() { return 42; }\n",
-	);
+	global_session
+		.add_builtins(
+			"m7c_builtin.slang",
+			"public int m7cBuiltinValue() { return 42; }\n",
+		)
+		.unwrap();
 
 	let target_desc = slang::TargetDesc::default().format(slang::CompileTarget::Spirv);
 	let targets = [target_desc];
@@ -2265,4 +2267,54 @@ fn thread_safety_concurrent_sessions_compile_in_parallel() {
 		assert_eq!(magic, 0x07230203, "bad SPIR-V magic");
 		assert_ne!(code.as_slice().len(), 0);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// NUL-in-input (panic-freedom) tests
+//
+// Public methods that take `&str` must not panic when the input contains an
+// interior NUL byte. Result-returning methods report it as an error; the
+// find/query methods fold it into their "not found" fallback.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nul_input_result_methods_return_error() {
+	let session = create_test_session();
+	let gs = global_session();
+
+	// A-class: methods already returning Result now surface NUL as an error.
+	assert!(session.load_module("test\0module").is_err());
+	assert!(
+		session
+			.load_module_from_source_string("m\0", "p.slang", "int f() { return 1; }")
+			.is_err()
+	);
+	assert!(
+		gs.set_downstream_compiler_path(slang::PassThrough::Gcc, "bad\0path")
+			.is_err()
+	);
+	assert!(
+		gs.set_language_prelude(slang::SourceLanguage::Slang, "pre\0lude")
+			.is_err()
+	);
+	assert!(
+		gs.add_builtins("p\0.slang", "public int f() { return 1; }")
+			.is_err()
+	);
+	assert!(slang::PreprocessorMacroDesc::new("M\0", "1").is_err());
+	assert!(slang::SpecializationArg::from_expr("fl\0oat").is_err());
+}
+
+#[test]
+fn nul_input_find_methods_fall_back_to_not_found() {
+	let session = create_test_session();
+	let gs = global_session();
+
+	// Find/query methods keep their signature and treat NUL as "not found".
+	assert!(gs.find_profile("glsl\0_450").is_unknown());
+	assert!(gs.find_capability("cap\0").is_unknown());
+
+	let module = session.load_module("test.slang").unwrap();
+	assert!(module.find_entry_point_by_name("mai\0n").is_none());
+	assert!(!session.is_binary_module_up_to_date("test\0.slang", &slang::Blob::new(&[1, 2, 3])));
 }
