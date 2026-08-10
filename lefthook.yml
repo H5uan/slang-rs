@@ -1,0 +1,14 @@
+# pre-commit hooks for shader-slang-rs.
+# Runs the same checks as CI before every commit.
+#
+# Install: lefthook install
+# Skip:    SKIP=test git commit  (or any hook name)
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      run: cargo fmt --check
+    clippy:
+      run: cargo clippy --workspace --all-targets -- -D warnings
+    test:
+      run: cargo test --workspace -- --test-threads=1
