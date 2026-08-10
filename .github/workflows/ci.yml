@@ -37,7 +37,13 @@ jobs:
       # shader-slang-rs-sys/build.rs, which are written against the release
       # artifacts but cannot be exercised on the Windows dev machine.
       #
-      # `--test-threads=1` avoids a flaky SIGBUS on the macOS CI runner
-      # (signal 10, access to undefined memory) when Slang's internal global
-      # state is accessed concurrently from multiple tests.
+      # `--test-threads=1` mitigates a flaky SIGBUS on the macOS CI runner
+      # (signal 10, access to undefined memory) during Slang's global state
+      # cleanup at process exit. The SIGBUS should be further reduced by the
+      # OnceLock-cached GlobalSession in tests.rs (never dropped, so the
+      # cleanup path is never triggered).
       - run: cargo test --workspace -- --test-threads=1
+
+      # Verify serde feature compiles (the feature is optional, so it is not
+      # covered by the default `cargo test` run above).
+      - run: cargo check --workspace --features serde

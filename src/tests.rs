@@ -1920,3 +1920,248 @@ fn byte_code_runner() {
 	// There is no public way to produce a Slang bytecode module in
 	// v2026.14.1, so `loadModule`/`execute` stay untested.
 }
+
+#[test]
+fn multi_target_compilation() {
+	// Compile to SPIR-V and DXIL simultaneously, verifying the output
+	// from both targets.
+	let gs = global_session();
+
+	// Override targets: SPIR-V + DXIL.
+	let spirv = slang::TargetDesc::default()
+		.format(slang::CompileTarget::Spirv)
+		.profile(gs.find_profile("glsl_450"));
+	let dxil = slang::TargetDesc::default()
+		.format(slang::CompileTarget::Dxil)
+		.profile(gs.find_profile("sm_6_5"));
+	let targets = [spirv, dxil];
+
+	// Rebuild the session with both targets.
+	let search_path = std::ffi::CString::new("shaders").unwrap();
+	let search_paths = [search_path.as_ptr()];
+	let session_desc = slang::SessionDesc::default()
+		.targets(&targets)
+		.search_paths(&search_paths);
+	let session = gs.create_session(&session_desc).unwrap();
+
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+
+	// Target 0: SPIR-V
+	let spirv_code = linked_program.entry_point_code(0, 0).unwrap();
+	assert!(!spirv_code.as_slice().is_empty());
+	// SPIR-V magic number: 0x07230203
+	let magic = u32::from_le_bytes(spirv_code.as_slice()[..4].try_into().unwrap());
+	assert_eq!(magic, 0x07230203, "not valid SPIR-V");
+
+	// Target 1: DXIL (if supported on this platform)
+	if gs.check_compile_target_support(slang::CompileTarget::Dxil).is_ok() {
+		let dxil_code = linked_program.entry_point_code(0, 1).unwrap();
+		assert!(!dxil_code.as_slice().is_empty());
+		// DXIL starts with a DXBC header ("DXBC" magic).
+		let header = &dxil_code.as_slice()[..4];
+		assert_eq!(header, b"DXBC", "not valid DXIL");
+	}
+}
+
+#[test]
+fn multi_entry_point() {
+	// Module with two entry points, both compiled and verified.
+	let session = create_test_session();
+	let source = r#"
+struct VertexOutput { float4 position : SV_Position; };
+
+[shader("vertex")]
+VertexOutput vertexMain(uint vid : SV_VertexID) {
+	VertexOutput output;
+	output.position = float4(vid, 0, 0, 1);
+	return output;
+}
+
+[shader("fragment")]
+float4 fragmentMain(VertexOutput input) : SV_Target { return input.position; }
+"#;
+	let module = session
+		.load_module_from_source_string("multi_ep", "multi_ep.slang", source)
+		.unwrap();
+	assert_eq!(module.entry_point_count(), 2);
+
+	let ep_vertex = module.find_entry_point_by_name("vertexMain").unwrap();
+	let ep_fragment = module.find_entry_point_by_name("fragmentMain").unwrap();
+	let ep_names: Vec<_> = module.entry_points().map(|ep| {
+		ep.function_reflection().name().unwrap_or("?").to_string()
+	}).collect();
+	assert_eq!(ep_names, ["vertexMain", "fragmentMain"]);
+
+	// Compile both entry points together.
+	let program = session
+		.create_composite_component_type(&[
+			module.into(),
+			ep_vertex.into(),
+			ep_fragment.into(),
+		])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let code_v = linked_program.entry_point_code(0, 0).unwrap();
+	let code_f = linked_program.entry_point_code(1, 0).unwrap();
+	assert!(!code_v.as_slice().is_empty());
+	assert!(!code_f.as_slice().is_empty());
+	// Both must be valid SPIR-V.
+	let magic_v = u32::from_le_bytes(code_v.as_slice()[..4].try_into().unwrap());
+	let magic_f = u32::from_le_bytes(code_f.as_slice()[..4].try_into().unwrap());
+	assert_eq!(magic_v, 0x07230203);
+	assert_eq!(magic_f, 0x07230203);
+}
+
+#[test]
+fn compiler_options_comprehensive() {
+	// Exercise all typed builder methods on CompilerOptions.
+	let gs = global_session();
+	let profile = gs.find_profile("glsl_450");
+	let capability = gs.find_capability("spirv_1_5");
+
+	let options = slang::CompilerOptions::default()
+		.optimization(slang::OptimizationLevel::High)
+		.matrix_layout_row(true)
+		.matrix_layout_column(false)
+		.profile(profile)
+		.capability(capability)
+		.language(slang::SourceLanguage::Slang)
+		.macro_define("TEST_MACRO", "42")
+		.include(".");
+
+	let search_path = std::ffi::CString::new(".").unwrap();
+	let search_paths = [search_path.as_ptr()];
+	let target_desc = slang::TargetDesc::default()
+		.format(slang::CompileTarget::Spirv)
+		.profile(profile);
+	let targets = [target_desc];
+	let session_desc = slang::SessionDesc::default()
+		.targets(&targets)
+		.search_paths(&search_paths)
+		.options(&options);
+	let session = gs.create_session(&session_desc).unwrap();
+
+	let source = r#"
+#if TEST_MACRO != 42
+#error "TEST_MACRO not set"
+#endif
+[numthreads(1, 1, 1)]
+[shader("compute")]
+void main(uint3 tid : SV_DispatchThreadID) { }
+"#;
+	let module = session
+		.load_module_from_source_string("opts_test", "opts_test.slang", source)
+		.unwrap();
+	assert!(module.find_entry_point_by_name("main").is_some());
+}
+
+#[test]
+fn rename_entry_point_and_hash() {
+	// Rename an entry point and verify the hash changes.
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+	let comp: slang::ComponentType = entry_point.into();
+	let hash_before = comp.entry_point_hash(0, 0);
+
+	let renamed = comp.rename_entry_point("renamed_main").unwrap();
+	let hash_after = renamed.entry_point_hash(0, 0);
+	assert_ne!(
+		hash_before.as_slice(),
+		hash_after.as_slice(),
+		"renamed entry point should produce a different hash",
+	);
+
+	// The renamed entry point still compiles valid SPIR-V.
+	let program = session
+		.create_composite_component_type(&[module.into(), renamed.into()])
+		.unwrap();
+	let linked = program.link().unwrap();
+	let code = linked.entry_point_code(0, 0).unwrap();
+	assert!(!code.as_slice().is_empty());
+}
+
+#[test]
+fn container_type_and_specialize() {
+	// Create a container type and specialize a concrete type against it.
+	let session = create_test_session();
+	let module = session
+		.load_module_from_source_string("cont", "cont.slang", "int g_data;\n")
+		.unwrap();
+	let program = slang::ComponentType::from(module);
+	let reflection = program.layout(0).unwrap();
+
+	let param = reflection.parameter_by_index(0).unwrap();
+	let ty = param.ty().unwrap();
+
+	// Wrap the scalar type in a container: UnsizedArray<int>.
+	let element_ty = session.container_type(ty, slang::ContainerType::UnsizedArray).unwrap();
+	assert_eq!(element_ty.kind(), slang::TypeKind::Array);
+	assert_eq!(element_ty.element_count(), 0); // unsized
+
+	// Container type of a StructuredBuffer<float>.
+	let float_module = session
+		.load_module_from_source_string("float_mod", "float_mod.slang", "float f;\n")
+		.unwrap();
+	let float_program = slang::ComponentType::from(float_module);
+	let float_reflection = float_program.layout(0).unwrap();
+	let float_param = float_reflection.parameter_by_index(0).unwrap();
+	let float_ty = float_param.ty().unwrap();
+	let sb_ty = session
+		.container_type(float_ty, slang::ContainerType::StructuredBuffer)
+		.unwrap();
+	assert_eq!(sb_ty.kind(), slang::TypeKind::Resource);
+}
+
+#[test]
+fn module_info_and_binary_up_to_date() {
+	// Serialize a module, read its info back, and check the up-to-date flag.
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let ir_blob = module.serialize().unwrap();
+
+	let info = session.module_info_from_ir_blob(&ir_blob).unwrap();
+	assert_eq!(info.name, Some("test.slang"));
+	assert!(info.version > 0);
+
+	// The serialized blob is derived from the current source, so it should
+	// be considered up-to-date.
+	let up_to_date = session.is_binary_module_up_to_date("shaders/test.slang", &ir_blob);
+	assert!(up_to_date);
+}
+
+#[test]
+fn spirv_validation() {
+	// Verify that the SPIR-V output is valid by checking the magic number
+	// and basic structure.
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let code = linked_program.entry_point_code(0, 0).unwrap();
+	let bytes = code.as_slice();
+
+	// SPIR-V binary format:
+	//   [0..4]   Magic number (0x07230203)
+	//   [4..8]   Version number
+	//   [8..12]  Generator's magic number
+	//   [12..16] Bound (ID bound)
+	//   [16..20] Schema (0 for standard SPIR-V)
+	assert!(bytes.len() >= 20, "SPIR-V too short: {} bytes", bytes.len());
+	let magic = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+	assert_eq!(magic, 0x07230203, "bad SPIR-V magic");
+	let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+	// SPIR-V 1.0 = 0x10000, 1.1 = 0x10100, 1.3 = 0x10300, 1.5 = 0x10500
+	assert!(
+		version >= 0x10000 && version <= 0x10600,
+		"unexpected SPIR-V version: 0x{version:08x}",
+	);
+}
