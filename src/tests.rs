@@ -2079,7 +2079,7 @@ fn rename_entry_point_and_hash() {
 
 	// The renamed entry point still compiles valid SPIR-V.
 	let program = session
-		.create_composite_component_type(&[module.into(), renamed.into()])
+		.create_composite_component_type(&[module.into(), renamed])
 		.unwrap();
 	let linked = program.link().unwrap();
 	let code = linked.entry_point_code(0, 0).unwrap();
@@ -2161,7 +2161,7 @@ fn spirv_validation() {
 	let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
 	// SPIR-V 1.0 = 0x10000, 1.1 = 0x10100, 1.3 = 0x10300, 1.5 = 0x10500
 	assert!(
-		version >= 0x10000 && version <= 0x10600,
+		(0x10000..=0x10600).contains(&version),
 		"unexpected SPIR-V version: 0x{version:08x}",
 	);
 }
