@@ -27,23 +27,93 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Cache the prebuilt Slang package that shader-slang-rs-sys/build.rs
+      # downloads into target/slang-bin/v<SLANG_VERSION>/. SLANG_VERSION in
+      # build.rs is the canonical version source and is bumped on every Slang
+      # upgrade (guarded by tests), so hashing build.rs keys the cache on the
+      # Slang version.
+      - uses: actions/cache@v4
+        with:
+          path: target/slang-bin
+          key: slang-bin-${{ runner.os }}-${{ hashFiles('shader-slang-rs-sys/build.rs') }}
+
+      - uses: Swatinem/rust-cache@v2
+
       - run: cargo fmt --all --check
 
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
       # cargo test performs a real download of the official prebuilt Slang
-      # binaries on Linux/macOS and compiles shaders against them; this is
-      # the verification path for the Linux/macOS branches of
-      # shader-slang-rs-sys/build.rs, which are written against the release
-      # artifacts but cannot be exercised on the Windows dev machine.
+      # binaries on Linux/macOS (cache-hit after the first run, see above)
+      # and compiles shaders against them; this is the verification path for
+      # the Linux/macOS branches of shader-slang-rs-sys/build.rs, which are
+      # written against the release artifacts but cannot be exercised on the
+      # Windows dev machine.
       #
-      # `--test-threads=1` mitigates a flaky SIGBUS on the macOS CI runner
-      # (signal 10, access to undefined memory) during Slang's global state
-      # cleanup at process exit. The SIGBUS should be further reduced by the
+      # `--test-threads=1` is load-bearing — do not remove it. All tests in
+      # src/tests.rs share one cached GlobalSession, and Slang's global
+      # session is not thread-safe (the wrapper is `Send` but deliberately
+      # not `Sync`; the `unsafe impl Sync` on the leaked-session holder is
+      # only sound because the shared session is never touched from two
+      # threads at once). Without the flag the suite reliably crashes with
+      # access violations (verified locally on Windows: exit code
+      # 0xc0000005, 2/2 parallel runs).
+      #
+      # Single-threading also mitigates a flaky SIGBUS on the macOS CI
+      # runner (signal 10, access to undefined memory) during Slang's global
+      # state cleanup at process exit. That is an upstream Slang teardown
+      # bug, not a binding bug (no matching upstream issue found as of
+      # 2026-08: https://github.com/shader-slang/slang/issues?q=SIGBUS); the
       # OnceLock-cached GlobalSession in tests.rs (never dropped, so the
-      # cleanup path is never triggered).
+      # cleanup path is never triggered) further reduces it.
       - run: cargo test --workspace -- --test-threads=1
 
       # Verify serde feature compiles (the feature is optional, so it is not
       # covered by the default `cargo test` run above).
       - run: cargo check --workspace --features serde
+
+  doc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # build.rs runs during `cargo doc` (bindgen needs slang.h), so it also
+      # downloads the prebuilt Slang package; cache it as in the test job.
+      - uses: actions/cache@v4
+        with:
+          path: target/slang-bin
+          key: slang-bin-${{ runner.os }}-${{ hashFiles('shader-slang-rs-sys/build.rs') }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # -D warnings turns broken intra-doc links and other rustdoc lints into
+      # errors (the crates use `#![warn(missing_docs)]`).
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Matches the workspace's declared `rust-version`.
+      - uses: dtolnay/rust-toolchain@1.85
+
+      - uses: actions/cache@v4
+        with:
+          path: target/slang-bin
+          key: slang-bin-${{ runner.os }}-${{ hashFiles('shader-slang-rs-sys/build.rs') }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # cargo check only, no clippy: on toolchains older than ~1.89 the
+      # dead-code lint does not count usages inside `const _: () = assert!(..)`
+      # items, so the sys crate's vtable method-count constants are falsely
+      # reported as dead code there. `-D warnings` clippy stays with the
+      # stable test job above, where the analysis is accurate.
+      - run: cargo check --workspace

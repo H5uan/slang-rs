@@ -1,0 +1,35 @@
+name: source-build
+
+on:
+  # Weekly, Tuesdays 03:17 UTC (off the top-of-hour/:30 cron rush).
+  schedule:
+    - cron: "17 3 * * 2"
+  workflow_dispatch:
+
+jobs:
+  source-build:
+    runs-on: ubuntu-latest
+    steps:
+      # Unlike ci.yml, this job checks out the slang/ submodule:
+      # `--features source-build` makes shader-slang-rs-sys/build.rs compile
+      # Slang from source with cmake instead of downloading the prebuilt
+      # release. ubuntu-latest ships cmake and a C++ toolchain preinstalled.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The cmake build of Slang dominates this job (tens of minutes); once
+      # the library exists, the test suite itself takes seconds, so run the
+      # full tests to validate the source-built binaries end to end rather
+      # than only checking that the build compiles.
+      #
+      # No caches on purpose: the point of the weekly job is to verify that a
+      # from-scratch source build of the pinned submodule keeps working, and
+      # a cold Slang build tree would blow past the Actions cache size limit
+      # anyway.
+      #
+      # `--test-threads=1` for the same reason as in ci.yml: the tests share
+      # one non-thread-safe GlobalSession (see the comment there).
+      - run: cargo test --workspace --features source-build -- --test-threads=1
