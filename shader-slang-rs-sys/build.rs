@@ -199,6 +199,12 @@ fn ensure_prebuilt(workspace_dir: &Path) -> PathBuf {
 		.expect("Couldn't read slang-bin staging directory.")
 		.flatten()
 	{
+		// share/ is ~24 MB of documentation we never consume, and its doc tree
+		// contains symlinks that dangle after extraction on unix, which makes
+		// actions/cache fail to save this directory in CI.
+		if entry.file_name() == "share" {
+			continue;
+		}
 		let dest = cache_dir.join(entry.file_name());
 		if dest.is_dir() {
 			std::fs::remove_dir_all(&dest).expect("Couldn't replace stale slang-bin cache entry.");
