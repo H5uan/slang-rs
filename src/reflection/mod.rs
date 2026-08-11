@@ -65,6 +65,35 @@ macro_rules! rcall {
 
 pub(super) use rcall;
 
+/// Implements [`std::fmt::Debug`] for a reflection wrapper as `Name(0x...)`,
+/// printing the underlying reflection object pointer without calling into
+/// Slang.
+macro_rules! reflection_debug {
+	($($name:ident),+ $(,)?) => {
+		$(
+			impl std::fmt::Debug for $name {
+				fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+					write!(f, concat!(stringify!($name), "({:p})"), self)
+				}
+			}
+		)+
+	};
+}
+
+reflection_debug!(
+	Decl,
+	EntryPoint,
+	Function,
+	Generic,
+	Shader,
+	Type,
+	TypeLayout,
+	TypeParameter,
+	UserAttribute,
+	Variable,
+	VariableLayout,
+);
+
 /// Trait to associate wrapper types with their underlying system types.
 /// This ensures conversions from raw pointers to wrapper types, as performed by the rcall! macro, are type-safe.
 ///

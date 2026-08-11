@@ -1,7 +1,7 @@
 use super::{Generic, Shader, UserAttribute, Variable, rcall};
 use crate::{
-	Blob, Error, IUnknown, ResourceAccess, ResourceShape, Result, ScalarType, TypeKind, succeeded,
-	sys,
+	Blob, Error, IUnknown, ResourceAccess, ResourceShape, Result, ScalarType, TypeKind, cstring,
+	succeeded, sys,
 };
 
 /// Reflection of a Slang type.
@@ -169,13 +169,14 @@ impl Type {
 		(0..self.user_attribute_count()).map(|i| self.user_attribute_by_index(i).unwrap())
 	}
 
-	/// Finds a user attribute by name, or returns `None` if there is no such
-	/// attribute.
-	pub fn find_user_attribute_by_name(&self, name: &str) -> Option<&UserAttribute> {
-		let name = std::ffi::CString::new(name).unwrap();
-		rcall!(
+	/// Finds a user attribute by name, or returns `Ok(None)` if there is no
+	/// such attribute. Returns `Err` when `name` contains an interior NUL
+	/// byte.
+	pub fn find_user_attribute_by_name(&self, name: &str) -> Result<Option<&UserAttribute>> {
+		let name = cstring(name)?;
+		Ok(rcall!(
 			spReflectionType_FindUserAttributeByName(self, name.as_ptr()) as Option<&UserAttribute>
-		)
+		))
 	}
 
 	/// Returns the generic declaration this type belongs to, or `None` if it
@@ -191,5 +192,17 @@ impl Type {
 			spReflectionType_applySpecializations(self, generic as *const _ as *mut _)
 				as Option<&Type>
 		)
+	}
+
+	/// Returns the number of type arguments of this specialized type, or 0 if
+	/// the type is not a specialization.
+	pub fn specialized_type_arg_count(&self) -> i64 {
+		rcall!(spReflectionType_getSpecializedTypeArgCount(self))
+	}
+
+	/// Returns the type argument at `index` of this specialized type, or
+	/// `None` if `index` is out of range.
+	pub fn specialized_type_arg_type(&self, index: i64) -> Option<&Type> {
+		rcall!(spReflectionType_getSpecializedTypeArgType(self, index) as Option<&Type>)
 	}
 }

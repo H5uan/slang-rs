@@ -2,7 +2,8 @@ use super::{
 	EntryPoint, Function, Generic, Type, TypeLayout, TypeParameter, Variable, VariableLayout, rcall,
 };
 use crate::{
-	Blob, Error, GenericArg, GenericArgType, IUnknown, LayoutRules, Result, succeeded, sys,
+	Blob, Error, GenericArg, GenericArgType, IUnknown, Interface, LayoutRules, Result, Session,
+	cstring, succeeded, sys,
 };
 
 /// Reflection of an entire shader program's layout.
@@ -45,11 +46,14 @@ impl Shader {
 		(0..self.type_parameter_count()).map(|i| self.type_parameter_by_index(i).unwrap())
 	}
 
-	/// Finds a global generic type parameter by name, or returns `None` if
-	/// there is no such parameter.
-	pub fn find_type_parameter_by_name(&self, name: &str) -> Option<&TypeParameter> {
-		let name = std::ffi::CString::new(name).unwrap();
-		rcall!(spReflection_FindTypeParameter(self, name.as_ptr()) as Option<&TypeParameter>)
+	/// Finds a global generic type parameter by name, or returns `Ok(None)`
+	/// if there is no such parameter. Returns `Err` when `name` contains
+	/// an interior NUL byte (which cannot be represented in a C string).
+	pub fn find_type_parameter_by_name(&self, name: &str) -> Result<Option<&TypeParameter>> {
+		let name = cstring(name)?;
+		Ok(rcall!(
+			spReflection_FindTypeParameter(self, name.as_ptr()) as Option<&TypeParameter>
+		))
 	}
 
 	/// Returns the number of entry points in the program.
@@ -68,11 +72,14 @@ impl Shader {
 		(0..self.entry_point_count()).map(|i| self.entry_point_by_index(i).unwrap())
 	}
 
-	/// Finds an entry point by name, or returns `None` if there is no such
-	/// entry point.
-	pub fn find_entry_point_by_name(&self, name: &str) -> Option<&EntryPoint> {
-		let name = std::ffi::CString::new(name).unwrap();
-		rcall!(spReflection_findEntryPointByName(self, name.as_ptr()) as Option<&EntryPoint>)
+	/// Finds an entry point by name, or returns `Ok(None)` if there is no
+	/// such entry point. Returns `Err` when `name` contains an interior
+	/// NUL byte.
+	pub fn find_entry_point_by_name(&self, name: &str) -> Result<Option<&EntryPoint>> {
+		let name = cstring(name)?;
+		Ok(rcall!(
+			spReflection_findEntryPointByName(self, name.as_ptr()) as Option<&EntryPoint>
+		))
 	}
 
 	/// Returns the binding index of the global constant buffer, or
@@ -89,37 +96,49 @@ impl Shader {
 		rcall!(spReflection_getGlobalConstantBufferSize(self))
 	}
 
-	/// Finds a type by name, or returns `None` if there is no such type.
-	pub fn find_type_by_name(&self, name: &str) -> Option<&Type> {
-		let name = std::ffi::CString::new(name).unwrap();
-		rcall!(spReflection_FindTypeByName(self, name.as_ptr()) as Option<&Type>)
+	/// Finds a type by name, or returns `Ok(None)` if there is no such
+	/// type. Returns `Err` when `name` contains an interior NUL byte.
+	pub fn find_type_by_name(&self, name: &str) -> Result<Option<&Type>> {
+		let name = cstring(name)?;
+		Ok(rcall!(
+			spReflection_FindTypeByName(self, name.as_ptr()) as Option<&Type>
+		))
 	}
 
-	/// Finds a function by name, or returns `None` if there is no such
-	/// function.
-	pub fn find_function_by_name(&self, name: &str) -> Option<&Function> {
-		let name = std::ffi::CString::new(name).unwrap();
-		rcall!(spReflection_FindFunctionByName(self, name.as_ptr()) as Option<&Function>)
+	/// Finds a function by name, or returns `Ok(None)` if there is no such
+	/// function. Returns `Err` when `name` contains an interior NUL byte.
+	pub fn find_function_by_name(&self, name: &str) -> Result<Option<&Function>> {
+		let name = cstring(name)?;
+		Ok(rcall!(
+			spReflection_FindFunctionByName(self, name.as_ptr()) as Option<&Function>
+		))
 	}
 
-	/// Finds a function by name among the members of `ty`, or returns `None`
-	/// if there is no such function.
-	pub fn find_function_by_name_in_type(&self, ty: &Type, name: &str) -> Option<&Function> {
-		let name = std::ffi::CString::new(name).unwrap();
-		rcall!(
-			spReflection_FindFunctionByNameInType(self, ty as *const _ as *mut _, name.as_ptr())
-				as Option<&Function>
-		)
+	/// Finds a function by name among the members of `ty`, or returns
+	/// `Ok(None)` if there is no such function. Returns `Err` when `name`
+	/// contains an interior NUL byte.
+	pub fn find_function_by_name_in_type(
+		&self,
+		ty: &Type,
+		name: &str,
+	) -> Result<Option<&Function>> {
+		let name = cstring(name)?;
+		Ok(rcall!(spReflection_FindFunctionByNameInType(
+			self,
+			ty as *const _ as *mut _,
+			name.as_ptr()
+		) as Option<&Function>))
 	}
 
-	/// Finds a variable by name among the members of `ty`, or returns `None`
-	/// if there is no such variable.
-	pub fn find_var_by_name_in_type(&self, ty: &Type, name: &str) -> Option<&Variable> {
-		let name = std::ffi::CString::new(name).unwrap();
-		rcall!(
+	/// Finds a variable by name among the members of `ty`, or returns
+	/// `Ok(None)` if there is no such variable. Returns `Err` when `name`
+	/// contains an interior NUL byte.
+	pub fn find_var_by_name_in_type(&self, ty: &Type, name: &str) -> Result<Option<&Variable>> {
+		let name = cstring(name)?;
+		Ok(rcall!(
 			spReflection_FindVarByNameInType(self, ty as *const _ as *mut _, name.as_ptr())
 				as Option<&Variable>
-		)
+		))
 	}
 
 	/// Returns the layout of `ty` under the given layout `rules`, or `None`
@@ -250,5 +269,21 @@ impl Shader {
 	/// program layout.
 	pub fn bindless_space_index(&self) -> i64 {
 		rcall!(spReflection_getBindlessSpaceIndex(self))
+	}
+
+	/// Returns the session this program reflection belongs to
+	/// (`spReflection_GetSession` in slang-deprecated.h).
+	///
+	/// The C function hands out a borrowed reference owned by the reflected
+	/// program; this method adds a reference, so the returned [`Session`]
+	/// keeps the session alive independently of this reflection.
+	pub fn session(&self) -> Option<Session> {
+		let session = rcall!(spReflection_GetSession(self));
+		let session = Session(IUnknown(std::ptr::NonNull::new(session as *mut _)?));
+		// SAFETY: `session` wraps a live `slang_ISession` pointer; adding a
+		// reference turns the borrowed pointer into an owned one matching the
+		// `IUnknown` RAII drop semantics (same pattern as `Session::load_module`).
+		unsafe { (session.as_unknown().vtable().ISlangUnknown_addRef)(session.as_raw()) };
+		Some(session)
 	}
 }

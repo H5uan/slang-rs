@@ -1,11 +1,17 @@
-use super::{Generic, Type, UserAttribute, Variable, rcall};
-use crate::{GlobalSession, Interface, Modifier, ModifierID, sys};
+use super::{Decl, Generic, Type, UserAttribute, Variable, rcall};
+use crate::{GlobalSession, Interface, Modifier, ModifierID, Result, cstring, sys};
 
 /// Reflection of a function in shader code (`FunctionReflection` in slang.h).
 #[repr(transparent)]
 pub struct Function(sys::SlangReflectionFunction);
 
 impl Function {
+	/// Returns this function viewed as a declaration, or `None` if
+	/// unavailable.
+	pub fn as_decl(&self) -> Option<&Decl> {
+		rcall!(spReflectionFunction_asDecl(self) as Option<&Decl>)
+	}
+
 	/// Returns the name of the function, or `None` if unavailable.
 	pub fn name(&self) -> Option<&str> {
 		rcall!(spReflectionFunction_GetName(self) as Option<&str>)
@@ -48,19 +54,19 @@ impl Function {
 	}
 
 	/// Finds a user-defined attribute on the function by name, or returns
-	/// `None` if there is none. Panics if `name` contains an interior NUL
-	/// byte.
+	/// `Ok(None)` if there is none. Returns `Err` when `name` contains an
+	/// interior NUL byte.
 	pub fn find_user_attribute_by_name(
 		&self,
 		global_session: &GlobalSession,
 		name: &str,
-	) -> Option<&UserAttribute> {
-		let name = std::ffi::CString::new(name).unwrap();
-		rcall!(spReflectionFunction_FindUserAttributeByName(
+	) -> Result<Option<&UserAttribute>> {
+		let name = cstring(name)?;
+		Ok(rcall!(spReflectionFunction_FindUserAttributeByName(
 			self,
 			global_session.as_raw(),
 			name.as_ptr()
-		) as Option<&UserAttribute>)
+		) as Option<&UserAttribute>))
 	}
 
 	/// Finds a modifier on the function by ID, e.g. an `[unroll]` attribute.

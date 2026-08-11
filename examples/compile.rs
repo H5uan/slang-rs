@@ -4,8 +4,6 @@
 //!
 //! Run with: `cargo run --example compile`
 
-use std::ffi::CString;
-
 use shader_slang_rs as slang;
 
 fn main() {
@@ -15,17 +13,17 @@ fn main() {
 	// example works from any working directory.
 	let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
 		.unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string());
-	let search_path = CString::new(format!("{manifest_dir}/shaders")).unwrap();
+	let search_path = format!("{manifest_dir}/shaders");
 
 	let target_desc = slang::TargetDesc::default()
 		.format(slang::CompileTarget::Spirv)
 		.profile(global_session.find_profile("glsl_450"));
 	let targets = [target_desc];
-	let search_paths = [search_path.as_ptr()];
 
 	let session_desc = slang::SessionDesc::default()
 		.targets(&targets)
-		.search_paths(&search_paths);
+		.search_paths(&[&search_path])
+		.unwrap();
 
 	let session = global_session.create_session(&session_desc).unwrap();
 	let module = session.load_module("test.slang").unwrap();

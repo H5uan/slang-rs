@@ -42,6 +42,16 @@
 //! By default the build downloads the prebuilt Slang v2026.14.1 binaries for
 //! your platform; see the README for build options (`source-build` feature,
 //! `SLANG_DIR` overrides).
+//!
+//! # Scope
+//!
+//! This crate covers Slang's compilation and reflection APIs. Deliberately
+//! out of scope (not currently wrapped; open an issue if you need them):
+//! `slang-gfx.h` (a separate GPU abstraction layer), `ICompileRequest` and
+//! the deprecated `sp*` compile-request API (the `spReflection*` reflection
+//! functions **are** covered), the raw-pointer/callback-driven
+//! `IByteCodeRunner` methods (see [`ByteCodeRunner`]), and
+//! `ISharedLibraryLoader`.
 
 #![warn(missing_docs)]
 
@@ -111,6 +121,20 @@ macro_rules! vcall {
 	};
 }
 
+/// Implements [`std::fmt::Debug`] for a COM interface wrapper as
+/// `Name(0x...)`, printing the interface pointer without calling into Slang.
+macro_rules! com_wrapper_debug {
+	($($name:ident),+ $(,)?) => {
+		$(
+			impl std::fmt::Debug for $name {
+				fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+					write!(f, concat!(stringify!($name), "({:p})"), self.as_unknown())
+				}
+			}
+		)+
+	};
+}
+
 pub(crate) const fn uuid(uuid: u128) -> UUID {
 	UUID {
 		data1: (uuid >> 96) as u32,
@@ -123,16 +147,33 @@ pub(crate) const fn uuid(uuid: u128) -> UUID {
 /// Error type returned by fallible operations in this crate.
 pub enum Error {
 	/// A raw Slang result code (`SlangResult`) when Slang reported failure
-	/// without a diagnostics blob.
+	/// without a diagnostics blob. [`last_internal_error_message`] may carry
+	/// additional context for internal errors.
 	Code(sys::SlangResult),
 	/// A Slang diagnostics blob holding the compiler's error messages.
 	Blob(Blob),
 }
 
+/// The `SLANG_*` error constant (`slang.h`) matching `code`, if it is one of
+/// the constants defined in the sys crate.
+fn slang_result_name(code: sys::SlangResult) -> Option<&'static str> {
+	match code {
+		sys::SLANG_FAIL => Some("SLANG_FAIL"),
+		sys::SLANG_E_NO_INTERFACE => Some("SLANG_E_NO_INTERFACE"),
+		sys::SLANG_E_INVALID_ARG => Some("SLANG_E_INVALID_ARG"),
+		sys::SLANG_E_NOT_FOUND => Some("SLANG_E_NOT_FOUND"),
+		sys::SLANG_E_NOT_IMPLEMENTED => Some("SLANG_E_NOT_IMPLEMENTED"),
+		_ => None,
+	}
+}
+
 impl std::fmt::Debug for Error {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
-			Error::Code(code) => write!(f, "{}", code),
+			Error::Code(code) => match slang_result_name(*code) {
+				Some(name) => write!(f, "Slang error {code:#010x} ({name})"),
+				None => write!(f, "Slang error {code:#010x}"),
+			},
 			Error::Blob(blob) => write!(f, "{}", blob.as_str().unwrap_or_default()),
 		}
 	}
@@ -213,12 +254,33 @@ pub fn build_tag_string() -> Option<&'static str> {
 	unsafe { str_from_slang(sys::spGetBuildTagString()) }
 }
 
+/// Returns the last internal error message signaled by Slang on the calling
+/// thread (`slang_getLastInternalErrorMessage` in slang.h), or `None` when no
+/// internal error has been signaled (or the message is empty / not valid
+/// UTF-8).
+///
+/// Slang reports internal failures (signals such as asserts and unexpected
+/// errors) through this thread-local channel rather than through diagnostics
+/// blobs, so it can add context to an [`Error::Code`] result. The message is
+/// overwritten by the next internal signal on the same thread, which is why
+/// this function returns an owned copy.
+pub fn last_internal_error_message() -> Option<String> {
+	// SAFETY: `slang_getLastInternalErrorMessage` returns null or a pointer to
+	// a NUL-terminated string in Slang-owned thread-local storage; the pointer
+	// stays valid until the next internal signal on this thread, and
+	// `str_from_slang` only reads it within this call.
+	let message = unsafe { str_from_slang(sys::slang_getLastInternalErrorMessage()) };
+	message
+		.filter(|message| !message.is_empty())
+		.map(String::from)
+}
+
 /// The internal ID of a compilation profile, as looked up by
 /// [`GlobalSession::find_profile`] (`SlangProfileID` in slang.h).
 ///
 /// Profile IDs are not guaranteed to be stable across versions of the Slang
 /// library, so look profiles up by name at runtime instead of hardcoding IDs.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProfileID(sys::SlangProfileID);
 
@@ -234,7 +296,7 @@ impl ProfileID {
 
 /// The internal ID of a capability, as looked up by
 /// [`GlobalSession::find_capability`] (`SlangCapabilityID` in slang.h).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CapabilityID(sys::SlangCapabilityID);
 
@@ -316,19 +378,26 @@ impl Drop for IUnknown {
 	}
 }
 
-// NOTE: `IUnknown` deliberately implements neither `Send` nor `Sync`.
+// NOTE on thread safety: `IUnknown` itself is deliberately neither `Send`
+// nor `Sync`, and no COM wrapper in this crate is `Sync`.
 //
-// COM's `AddRef`/`Release` refcounting is thread-safe, so a *single* COM
-// reference could in principle be moved between threads. But Slang does not
-// make its interfaces safe to share or to call concurrently: slang.h states
-// that "a global session and the objects created from it" (i.e. sessions,
-// modules, component types, ...) "are not thread-safe" and "should be
-// externally synchronized when shared across threads". Because `Clone` can
-// produce several independent wrappers around the same underlying COM
-// object, marking the base `Send` would let those clones be moved to
-// different threads and called concurrently — a data race the type system
-// would not catch. So the base is `!Send + !Sync`, and only the genuinely
-// immutable, read-only wrappers ([`Blob`], [`Metadata`]) opt back in below.
+// slang.h documents that "a global session and the objects created from
+// it" (sessions, modules, component types, ...) "should be externally
+// synchronized when shared across threads", while "distinct global
+// sessions may be used from different threads in parallel" — an object
+// may move between threads as long as it is only used from one thread at
+// a time. That is exactly Rust's `Send` (transfer of exclusive
+// ownership), so every concrete wrapper below opts into `Send` (COM
+// `AddRef`/`Release` are internally synchronized, so releasing a
+// reference on another thread is safe). `Sync` is never implemented:
+// `&T` can be shared without synchronization, which would allow the
+// concurrent calls Slang does not support.
+//
+// One caveat the type system cannot express: `Clone` hands out another
+// owned handle to the *same* object, so clones sent to different threads
+// count as "shared across threads" in slang.h's sense and still need
+// the caller's external synchronization. Only the genuinely immutable,
+// read-only wrappers ([`Blob`], [`Metadata`]) are also `Sync`.
 
 impl IUnknown {
 	/// Queries this object for the interface `T`, returning an owned reference
@@ -405,6 +474,13 @@ impl Blob {
 	pub fn as_slice(&self) -> &[u8] {
 		let ptr = vcall!(self, getBufferPointer());
 		let size = vcall!(self, getBufferSize());
+		// Slang can produce empty blobs with a null buffer pointer (e.g.
+		// `slang_createBlob` returns null for empty input), and
+		// `from_raw_parts` requires a non-null pointer even for a
+		// zero-length slice.
+		if ptr.is_null() {
+			return &[];
+		}
 		// SAFETY: a live `ISlangBlob` guarantees `getBufferPointer` points to
 		// `getBufferSize` readable bytes owned by the blob, which outlives
 		// `&self`.
@@ -433,6 +509,12 @@ unsafe impl Interface for SharedLibrary {
 	const IID: UUID = uuid(0x70db_c7c4_dc3b_4a07_ae7e_752a_f6a8_1555);
 }
 
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for SharedLibrary {}
+
 impl SharedLibrary {
 	/// Finds the address of a symbol (a function or variable) exported by the
 	/// compiled code (`ISlangSharedLibrary::findSymbolAddressByName`; slang.h
@@ -460,6 +542,12 @@ unsafe impl Interface for Clonable {
 	const IID: UUID = uuid(0x1ec3_6168_e9f4_430d_bb17_048a_8046_b31f);
 }
 
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for Clonable {}
+
 impl Clonable {
 	/// Clones the object for the specified interface `T` (`ISlangClonable::clone`).
 	/// Returns `None` when the object does not support the requested interface.
@@ -486,15 +574,38 @@ unsafe impl Interface for Writer {
 	const IID: UUID = uuid(0xec45_7f0e_9add_4e6b_851c_d7fa_716d_15fd);
 }
 
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for Writer {}
+
 impl Writer {
 	/// Begins an append buffer (`ISlangWriter::beginAppendBuffer`).
 	/// Only one append buffer can be active at a time.
-	pub fn begin_append_buffer(&self, max_num_chars: usize) -> *mut u8 {
+	///
+	/// # Safety
+	///
+	/// The returned pointer designates a writer-owned buffer with room for
+	/// at most `max_num_chars` bytes; the caller must not write past that
+	/// limit and must pass the exact same pointer back to
+	/// [`Writer::end_append_buffer`] before starting another append buffer
+	/// or otherwise using the writer.
+	pub unsafe fn begin_append_buffer(&self, max_num_chars: usize) -> *mut u8 {
 		vcall!(self, beginAppendBuffer(max_num_chars)) as *mut u8
 	}
 
 	/// Ends the append buffer and writes its content (`ISlangWriter::endAppendBuffer`).
-	pub fn end_append_buffer(&self, buffer: &[u8]) -> Result<()> {
+	///
+	/// # Safety
+	///
+	/// `buffer` must start at the exact pointer returned by the matching
+	/// [`Writer::begin_append_buffer`] call (slang.h requires it to be
+	/// identical to the last `beginAppendBuffer` result), and its length
+	/// must not exceed the `max_num_chars` that call requested — i.e. it
+	/// designates exactly the region the caller wrote into the append
+	/// buffer.
+	pub unsafe fn end_append_buffer(&self, buffer: &[u8]) -> Result<()> {
 		let result = vcall!(
 			self,
 			endAppendBuffer(buffer.as_ptr() as *mut i8, buffer.len())
@@ -545,6 +656,12 @@ unsafe impl Interface for Profiler {
 	const IID: UUID = uuid(0x1977_72c7_0155_4b91_84e8_6668_baff_0619);
 }
 
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for Profiler {}
+
 impl Profiler {
 	/// Gets the number of profiling entries (`ISlangProfiler::getEntryCount`).
 	pub fn entry_count(&self) -> usize {
@@ -590,6 +707,12 @@ unsafe impl Interface for MutableFileSystem {
 	const IID: UUID = uuid(0xa058_675c_1d65_452a_8458_ccde_d142_7105);
 }
 
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for MutableFileSystem {}
+
 impl MutableFileSystem {
 	/// Loads the file at `path` and returns its exact bytes
 	/// (`ISlangFileSystem::loadFile`).
@@ -602,9 +725,11 @@ impl MutableFileSystem {
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(blob as *mut _).unwrap(),
-		)))
+		let Some(blob) = std::ptr::NonNull::new(blob as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Blob(IUnknown(blob)))
 	}
 
 	/// Returns a string that uniquely identifies the object at `path`
@@ -622,9 +747,11 @@ impl MutableFileSystem {
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(identity as *mut _).unwrap(),
-		)))
+		let Some(identity) = std::ptr::NonNull::new(identity as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Blob(IUnknown(identity)))
 	}
 
 	/// Combines `from_path` with `path` into a single path
@@ -653,9 +780,11 @@ impl MutableFileSystem {
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(combined as *mut _).unwrap(),
-		)))
+		let Some(combined) = std::ptr::NonNull::new(combined as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Blob(IUnknown(combined)))
 	}
 
 	/// Returns whether `path` names a file or a directory
@@ -681,9 +810,11 @@ impl MutableFileSystem {
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(out_path as *mut _).unwrap(),
-		)))
+		let Some(out_path) = std::ptr::NonNull::new(out_path as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Blob(IUnknown(out_path)))
 	}
 
 	/// Clears any cached path information the file system holds
@@ -813,6 +944,12 @@ unsafe impl Interface for GlobalSession {
 	const IID: UUID = uuid(0xc140_b5fd_0c78_452e_ba7c_1a1e_70c7_f71c);
 }
 
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for GlobalSession {}
+
 impl GlobalSession {
 	/// Creates a global session with the core module available
 	/// (`slang_createGlobalSession` in slang.h). Returns `None` when Slang
@@ -845,6 +982,26 @@ impl GlobalSession {
 				&mut global_session,
 			)
 		};
+		Some(GlobalSession(IUnknown(std::ptr::NonNull::new(
+			global_session as *mut _,
+		)?)))
+	}
+
+	/// Creates a global session from a descriptor
+	/// (`slang_createGlobalSession2` in slang.h), which exposes
+	/// global-session-level options such as GLSL support
+	/// ([`GlobalSessionDesc::enable_glsl`]) and the minimum language version
+	/// ([`GlobalSessionDesc::min_language_version`]). Returns `None` when
+	/// Slang fails to create the session.
+	pub fn new_with_desc(desc: &GlobalSessionDesc) -> Option<GlobalSession> {
+		let mut global_session = null_mut();
+		// SAFETY: `desc` is a valid, fully initialized descriptor and
+		// `global_session` is a valid out-pointer; on success it receives a
+		// new reference owned by the caller.
+		let result = unsafe { sys::slang_createGlobalSession2(&desc.inner, &mut global_session) };
+		if !succeeded(result) {
+			return None;
+		}
 		Some(GlobalSession(IUnknown(std::ptr::NonNull::new(
 			global_session as *mut _,
 		)?)))
@@ -1000,9 +1157,11 @@ impl GlobalSession {
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(blob as *mut _).unwrap(),
-		)))
+		let Some(blob) = std::ptr::NonNull::new(blob as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Blob(IUnknown(blob)))
 	}
 
 	/// Returns the time in seconds spent in the Slang compiler and in
@@ -1066,9 +1225,11 @@ impl GlobalSession {
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(blob as *mut _).unwrap(),
-		)))
+		let Some(blob) = std::ptr::NonNull::new(blob as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Blob(IUnknown(blob)))
 	}
 
 	/// Adds new builtin declarations, given as Slang source, to be used in
@@ -1217,9 +1378,11 @@ impl GlobalSession {
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(blob as *mut _).unwrap(),
-		)))
+		let Some(blob) = std::ptr::NonNull::new(blob as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Blob(IUnknown(blob)))
 	}
 }
 
@@ -1242,6 +1405,14 @@ impl std::ops::Deref for ParsedCommandLine {
 
 	fn deref(&self) -> &Self::Target {
 		&self.desc
+	}
+}
+
+impl std::fmt::Debug for ParsedCommandLine {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_tuple("ParsedCommandLine")
+			.field(&self.desc)
+			.finish()
 	}
 }
 
@@ -1286,6 +1457,16 @@ impl SpecializationArg {
 	}
 }
 
+impl std::fmt::Debug for SpecializationArg {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		// The value union has no `Debug` impl (bindgen does not derive it for
+		// unions), so only the kind is printed.
+		f.debug_struct("SpecializationArg")
+			.field("kind", &self.inner.kind)
+			.finish_non_exhaustive()
+	}
+}
+
 /// Collects the raw sys arguments for a specialize call. The returned vector
 /// borrows the strings owned by the input slice, which must outlive it.
 fn specialization_args_as_sys(args: &[SpecializationArg]) -> Vec<sys::slang_SpecializationArg> {
@@ -1306,6 +1487,12 @@ unsafe impl Interface for Session {
 	type Vtable = sys::ISessionVtable;
 	const IID: UUID = uuid(0x6761_8701_d116_468f_ab3b_474b_edce_0e3d);
 }
+
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for Session {}
 
 impl Session {
 	/// Loads a module by name, as code using `import` would
@@ -1503,9 +1690,13 @@ impl Session {
 			diagnostics,
 		)?;
 
-		Ok(ComponentType(IUnknown(
-			std::ptr::NonNull::new(composite_component_type as *mut _).unwrap(),
-		)))
+		let Some(composite_component_type) =
+			std::ptr::NonNull::new(composite_component_type as *mut _)
+		else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(ComponentType(IUnknown(composite_component_type)))
 	}
 
 	/// Specializes an existential (interface) type by plugging in concrete
@@ -1570,9 +1761,11 @@ impl Session {
 			diagnostics,
 		)?;
 
-		Ok(TypeConformance(IUnknown(
-			std::ptr::NonNull::new(conformance as *mut _).unwrap(),
-		)))
+		let Some(conformance) = std::ptr::NonNull::new(conformance as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(TypeConformance(IUnknown(conformance)))
 	}
 
 	/// Gets the global session that was used to create this session.
@@ -1684,9 +1877,11 @@ impl Session {
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(name as *mut _).unwrap(),
-		)))
+		let Some(name) = std::ptr::NonNull::new(name as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Blob(IUnknown(name)))
 	}
 
 	/// Gets the mangled name for a type witness of `type_`'s conformance to
@@ -1710,9 +1905,11 @@ impl Session {
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(name as *mut _).unwrap(),
-		)))
+		let Some(name) = std::ptr::NonNull::new(name as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Blob(IUnknown(name)))
 	}
 
 	/// Gets the sequential ID used to identify a type witness in a dynamic
@@ -1861,6 +2058,7 @@ impl Session {
 /// Module metadata read from a serialized module blob by
 /// [`Session::module_info_from_ir_blob`]. Borrows strings owned by the
 /// session.
+#[derive(Debug)]
 pub struct ModuleInfo<'a> {
 	/// The version of the serialized module format.
 	pub version: i64,
@@ -1899,6 +2097,16 @@ impl SourceLocation<'_> {
 	}
 }
 
+impl std::fmt::Debug for SourceLocation<'_> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("SourceLocation")
+			.field("file_path", &self.file_path())
+			.field("line", &self.line())
+			.field("column", &self.column())
+			.finish()
+	}
+}
+
 /// An owned reference to Slang metadata about a compiled program or entry
 /// point (`IMetadata` in slang.h), obtained from
 /// [`ComponentType::target_metadata`] / [`ComponentType::entry_point_metadata`]
@@ -1913,11 +2121,15 @@ unsafe impl Interface for Metadata {
 	const IID: UUID = uuid(0x8044_a8a3_ddc0_4b7f_af8e_026e_905d_7332);
 }
 
-// SAFETY: slang.h states that metadata objects "are immutable once returned
-// to the host; concurrent read-only queries are allowed as long as callers
-// keep the owning COM object alive". The wrapper holds an owned reference
-// (keeping the COM object alive), and all `Metadata` methods are read-only,
-// so it is safe to share across threads.
+// SAFETY: slang.h documents immutability only on specific metadata
+// interfaces (the `ISyntheticResourceMetadata` doc block states metadata
+// objects "are immutable once returned to the host; concurrent read-only
+// queries are allowed as long as callers keep the owning COM object
+// alive"). Generalizing that to every `IMetadata` implementation is an
+// assumption: all metadata objects Slang v2026.14.1 produces are
+// read-only once returned, but slang.h does not guarantee it for the
+// base interface. The wrapper holds an owned reference (keeping the COM
+// object alive), and all `Metadata` methods are read-only queries.
 unsafe impl Send for Metadata {}
 unsafe impl Sync for Metadata {}
 
@@ -1989,6 +2201,12 @@ unsafe impl Interface for CompileResult {
 	const IID: UUID = uuid(0x5fa9_380e_b62f_41e5_9f12_4bad_4d9e_aae4);
 }
 
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for CompileResult {}
+
 impl CompileResult {
 	/// The number of output blobs stored in this compile result.
 	pub fn item_count(&self) -> u32 {
@@ -2005,9 +2223,11 @@ impl CompileResult {
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(blob as *mut _).unwrap(),
-		)))
+		let Some(blob) = std::ptr::NonNull::new(blob as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Blob(IUnknown(blob)))
 	}
 
 	/// Gets the metadata associated with this compile result, e.g. the debug
@@ -2020,9 +2240,11 @@ impl CompileResult {
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
-		Ok(Metadata(IUnknown(
-			std::ptr::NonNull::new(metadata as *mut _).unwrap(),
-		)))
+		let Some(metadata) = std::ptr::NonNull::new(metadata as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Metadata(IUnknown(metadata)))
 	}
 }
 
@@ -2042,6 +2264,12 @@ unsafe impl Interface for ComponentType2 {
 	const IID: UUID = uuid(0x9c2a_4b3d_7f68_4e91_a52c_8b19_3e45_7a9f);
 }
 
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for ComponentType2 {}
+
 impl ComponentType2 {
 	/// Gets the compile result of the target at `target_index`, holding the
 	/// base and debug output blobs and their metadata.
@@ -2057,9 +2285,11 @@ impl ComponentType2 {
 			diagnostics,
 		)?;
 
-		Ok(CompileResult(IUnknown(
-			std::ptr::NonNull::new(compile_result as *mut _).unwrap(),
-		)))
+		let Some(compile_result) = std::ptr::NonNull::new(compile_result as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(CompileResult(IUnknown(compile_result)))
 	}
 
 	/// Gets the compile result of the entry point at `entry_point_index` for
@@ -2085,9 +2315,11 @@ impl ComponentType2 {
 			diagnostics,
 		)?;
 
-		Ok(CompileResult(IUnknown(
-			std::ptr::NonNull::new(compile_result as *mut _).unwrap(),
-		)))
+		let Some(compile_result) = std::ptr::NonNull::new(compile_result as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(CompileResult(IUnknown(compile_result)))
 	}
 
 	/// Compiles all entry points for the chosen `target_index` into
@@ -2111,9 +2343,11 @@ impl ComponentType2 {
 			diagnostics,
 		)?;
 
-		Ok(SharedLibrary(IUnknown(
-			std::ptr::NonNull::new(shared_library as *mut _).unwrap(),
-		)))
+		let Some(shared_library) = std::ptr::NonNull::new(shared_library as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(SharedLibrary(IUnknown(shared_library)))
 	}
 }
 
@@ -2128,6 +2362,12 @@ unsafe impl Interface for BindlessResourceMetadata {
 	type Vtable = sys::IBindlessResourceMetadataVtable;
 	const IID: UUID = uuid(0xeafa_96d3_2352_4bf4_8864_3228_a407_7a83);
 }
+
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for BindlessResourceMetadata {}
 
 impl BindlessResourceMetadata {
 	/// Returns true when the compiled target IR still contains a bindless
@@ -2148,6 +2388,12 @@ unsafe impl Interface for CoverageTracingMetadata {
 	type Vtable = sys::ICoverageTracingMetadataVtable;
 	const IID: UUID = uuid(0x7c9f_1d50_1e4a_4b9c_8e21_3f7b_82a3_d951);
 }
+
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for CoverageTracingMetadata {}
 
 impl CoverageTracingMetadata {
 	/// Number of runtime counter slots in the synthesized coverage buffer.
@@ -2228,6 +2474,7 @@ impl CoverageTracingMetadata {
 /// [`CoverageTracingMetadata::entry_info`] (`slang::CoverageEntryInfo` in
 /// slang.h, minus the leading `structSize` ABI field). Borrows strings owned
 /// by the metadata object.
+#[derive(Debug)]
 pub struct CoverageEntryInfo<'a> {
 	/// Source file for this coverage entry, if it could be attributed to a
 	/// real source file.
@@ -2267,6 +2514,7 @@ pub struct CoverageEntryInfo<'a> {
 /// [`CoverageTracingMetadata::buffer_info`] (`slang::CoverageBufferInfo` in
 /// slang.h, minus the leading `structSize` ABI field). A `-1` sentinel means
 /// the value is not reported for the current target.
+#[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CoverageBufferInfo {
 	/// Register space the coverage buffer is bound to (D3D12 `space`, Vulkan
@@ -2291,6 +2539,12 @@ unsafe impl Interface for SyntheticResourceMetadata {
 	type Vtable = sys::ISyntheticResourceMetadataVtable;
 	const IID: UUID = uuid(0x47a3_3723_181b_4d2b_b89e_2154_95bb_388b);
 }
+
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for SyntheticResourceMetadata {}
 
 impl SyntheticResourceMetadata {
 	/// Number of synthetic bindable resources reported by this metadata
@@ -2362,6 +2616,7 @@ impl SyntheticResourceMetadata {
 /// (`slang::SyntheticResourceInfo` in slang.h, minus the leading `structSize`
 /// ABI field). Borrows strings owned by the metadata object. See slang.h for
 /// the `-1`/`0` sentinel conventions of the location fields.
+#[derive(Debug)]
 pub struct SyntheticResourceInfo<'a> {
 	/// Stable, opaque, non-zero synthetic resource identifier within the
 	/// compiled program.
@@ -2401,6 +2656,12 @@ unsafe impl Interface for CooperativeTypesMetadata {
 	type Vtable = sys::ICooperativeTypesMetadataVtable;
 	const IID: UUID = uuid(0x64c4_d536_d949_49c3_9fde_3f0f_9c6f_0131);
 }
+
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for CooperativeTypesMetadata {}
 
 impl CooperativeTypesMetadata {
 	/// Number of cooperative matrix types used by the compiled target.
@@ -2522,6 +2783,12 @@ unsafe impl Interface for ComponentType {
 	const IID: UUID = uuid(0x5bc4_2be8_5c50_4929_9e5e_d15e_7c24_015f);
 }
 
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for ComponentType {}
+
 impl ComponentType {
 	/// Gets the session this component type belongs to.
 	pub fn get_session(&self) -> Session {
@@ -2585,20 +2852,29 @@ impl ComponentType {
 			diagnostics,
 		)?;
 
-		Ok(ComponentType(IUnknown(
-			std::ptr::NonNull::new(specialized_component_type as *mut _).unwrap(),
-		)))
+		let Some(specialized_component_type) =
+			std::ptr::NonNull::new(specialized_component_type as *mut _)
+		else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(ComponentType(IUnknown(specialized_component_type)))
 	}
 
 	/// Computes a hash for the entry point at `entry_point_index` for the
 	/// chosen `target_index`, usable as a key for shader caching.
-	pub fn entry_point_hash(&self, entry_point_index: i64, target_index: i64) -> Blob {
+	pub fn entry_point_hash(&self, entry_point_index: i64, target_index: i64) -> Result<Blob> {
 		let mut hash = null_mut();
+		// `getEntryPointHash` returns no result code; a null out-pointer is
+		// the only failure signal.
 		vcall!(
 			self,
 			getEntryPointHash(entry_point_index, target_index, &mut hash)
 		);
-		Blob(IUnknown(std::ptr::NonNull::new(hash as *mut _).unwrap()))
+		let Some(hash) = std::ptr::NonNull::new(hash as *mut _) else {
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Blob(IUnknown(hash)))
 	}
 
 	/// Returns a new component type that represents a renamed entry point.
@@ -2615,9 +2891,11 @@ impl ComponentType {
 			return Err(Error::Code(result));
 		}
 
-		Ok(ComponentType(IUnknown(
-			std::ptr::NonNull::new(entry_point as *mut _).unwrap(),
-		)))
+		let Some(entry_point) = std::ptr::NonNull::new(entry_point as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(ComponentType(IUnknown(entry_point)))
 	}
 
 	/// Links this component type, specifying additional compiler options used
@@ -2639,9 +2917,12 @@ impl ComponentType {
 			diagnostics,
 		)?;
 
-		Ok(ComponentType(IUnknown(
-			std::ptr::NonNull::new(linked_component_type as *mut _).unwrap(),
-		)))
+		let Some(linked_component_type) = std::ptr::NonNull::new(linked_component_type as *mut _)
+		else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(ComponentType(IUnknown(linked_component_type)))
 	}
 
 	/// Links this component type against all of its unsatisfied dependencies
@@ -2658,9 +2939,12 @@ impl ComponentType {
 			diagnostics,
 		)?;
 
-		Ok(ComponentType(IUnknown(
-			std::ptr::NonNull::new(linked_component_type as *mut _).unwrap(),
-		)))
+		let Some(linked_component_type) = std::ptr::NonNull::new(linked_component_type as *mut _)
+		else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(ComponentType(IUnknown(linked_component_type)))
 	}
 
 	/// Gets the compiled code for the chosen `target`
@@ -2678,9 +2962,11 @@ impl ComponentType {
 			diagnostics,
 		)?;
 
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(code as *mut _).unwrap(),
-		)))
+		let Some(code) = std::ptr::NonNull::new(code as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Blob(IUnknown(code)))
 	}
 
 	/// Gets the compiled code for the entry point at `index` for the chosen
@@ -2701,9 +2987,11 @@ impl ComponentType {
 			diagnostics,
 		)?;
 
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(code as *mut _).unwrap(),
-		)))
+		let Some(code) = std::ptr::NonNull::new(code as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Blob(IUnknown(code)))
 	}
 
 	/// Gets the compilation result for the entry point at `index` for the
@@ -2724,9 +3012,11 @@ impl ComponentType {
 			return Err(Error::Code(result));
 		}
 
-		Ok(MutableFileSystem(IUnknown(
-			std::ptr::NonNull::new(file_system as *mut _).unwrap(),
-		)))
+		let Some(file_system) = std::ptr::NonNull::new(file_system as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(MutableFileSystem(IUnknown(file_system)))
 	}
 
 	/// Gets metadata for the chosen `target_index`
@@ -2747,9 +3037,11 @@ impl ComponentType {
 			diagnostics,
 		)?;
 
-		Ok(Metadata(IUnknown(
-			std::ptr::NonNull::new(metadata as *mut _).unwrap(),
-		)))
+		let Some(metadata) = std::ptr::NonNull::new(metadata as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Metadata(IUnknown(metadata)))
 	}
 
 	/// Gets metadata for the entry point at `entry_point_index` for the chosen
@@ -2779,9 +3071,11 @@ impl ComponentType {
 			diagnostics,
 		)?;
 
-		Ok(Metadata(IUnknown(
-			std::ptr::NonNull::new(metadata as *mut _).unwrap(),
-		)))
+		let Some(metadata) = std::ptr::NonNull::new(metadata as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Metadata(IUnknown(metadata)))
 	}
 
 	/// Compiles the entry point at `entry_point_index` for the chosen
@@ -2817,9 +3111,11 @@ impl ComponentType {
 			diagnostics,
 		)?;
 
-		Ok(SharedLibrary(IUnknown(
-			std::ptr::NonNull::new(shared_library as *mut _).unwrap(),
-		)))
+		let Some(shared_library) = std::ptr::NonNull::new(shared_library as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(SharedLibrary(IUnknown(shared_library)))
 	}
 
 	/// Queries this component type for the [`ComponentType2`] extension
@@ -2841,6 +3137,12 @@ unsafe impl Interface for EntryPoint {
 	type Vtable = sys::IEntryPointVtable;
 	const IID: UUID = uuid(0x8f24_1361_f5bd_4ca0_a3ac_02f7_fa24_02b8);
 }
+
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for EntryPoint {}
 
 impl From<EntryPoint> for ComponentType {
 	fn from(value: EntryPoint) -> Self {
@@ -2877,6 +3179,12 @@ unsafe impl Interface for TypeConformance {
 	const IID: UUID = uuid(0x73eb_3147_e544_41b5_b8f0_a244_df21_940b);
 }
 
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for TypeConformance {}
+
 impl From<TypeConformance> for ComponentType {
 	fn from(value: TypeConformance) -> Self {
 		// SAFETY: `ITypeConformance` inherits `IComponentType` in slang.h, so
@@ -2897,6 +3205,12 @@ unsafe impl Interface for Module {
 	type Vtable = sys::IModuleVtable;
 	const IID: UUID = uuid(0x0c72_0e64_8722_4d31_8990_638a_98b1_c279);
 }
+
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for Module {}
 
 impl From<Module> for ComponentType {
 	fn from(value: Module) -> Self {
@@ -3011,9 +3325,11 @@ impl Module {
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(blob as *mut _).unwrap(),
-		)))
+		let Some(blob) = std::ptr::NonNull::new(blob as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Blob(IUnknown(blob)))
 	}
 
 	/// Writes the serialized representation of this module to a file.
@@ -3043,9 +3359,11 @@ impl Module {
 			diagnostics,
 		)?;
 
-		Ok(EntryPoint(IUnknown(
-			std::ptr::NonNull::new(entry_point as *mut _).unwrap(),
-		)))
+		let Some(entry_point) = std::ptr::NonNull::new(entry_point as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(EntryPoint(IUnknown(entry_point)))
 	}
 
 	/// Disassembles the module into human-readable IR text.
@@ -3057,7 +3375,11 @@ impl Module {
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
-		let blob = Blob(IUnknown(std::ptr::NonNull::new(blob as *mut _).unwrap()));
+		let Some(blob) = std::ptr::NonNull::new(blob as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		let blob = Blob(IUnknown(blob));
 		Ok(String::from_utf8_lossy(blob.as_slice()).into_owned())
 	}
 
@@ -3082,6 +3404,12 @@ unsafe impl Interface for ModulePrecompileService {
 	type Vtable = sys::IModulePrecompileServiceExperimentalVtable;
 	const IID: UUID = uuid(0x8e12_e8e3_5fcd_433e_afcb_13a0_88bc_5ee5);
 }
+
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for ModulePrecompileService {}
 
 impl ModulePrecompileService {
 	/// Precompiles the module for `target` and embeds the resulting target
@@ -3121,9 +3449,11 @@ impl ModulePrecompileService {
 			diagnostics,
 		)?;
 
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(code as *mut _).unwrap(),
-		)))
+		let Some(code) = std::ptr::NonNull::new(code as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
+		Ok(Blob(IUnknown(code)))
 	}
 
 	/// Gets the number of modules this module depends on
@@ -3152,6 +3482,7 @@ impl ModulePrecompileService {
 		)?;
 
 		let Some(module) = std::ptr::NonNull::new(module as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
 			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
 		};
 		Ok(Module(IUnknown(module)))
@@ -3185,6 +3516,12 @@ pub struct ByteCodeRunner {
 	module_loaded: Arc<AtomicBool>,
 }
 
+impl std::fmt::Debug for ByteCodeRunner {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "ByteCodeRunner({:p})", self.inner.as_unknown())
+	}
+}
+
 /// The raw COM wrapper behind [`ByteCodeRunner`], kept `repr(transparent)` so
 /// the [`Interface`] safety contract holds.
 #[repr(transparent)]
@@ -3195,6 +3532,12 @@ unsafe impl Interface for ByteCodeRunnerInner {
 	type Vtable = sys::IByteCodeRunnerVtable;
 	const IID: UUID = uuid(0xafda_b195_361f_42cb_9513_9006_261d_d8cd);
 }
+
+// SAFETY: per slang.h's threading contract (see the note on `IUnknown`),
+// a Slang object may move between threads with exclusive ownership —
+// exactly Rust's `Send`; COM `AddRef`/`Release` are internally
+// synchronized. `Sync` is deliberately not implemented.
+unsafe impl Send for ByteCodeRunnerInner {}
 
 impl ByteCodeRunner {
 	/// Creates a bytecode runner with the default description
@@ -3210,8 +3553,12 @@ impl ByteCodeRunner {
 		if !succeeded(result) {
 			return Err(Error::Code(result));
 		}
+		let Some(runner) = std::ptr::NonNull::new(runner as *mut _) else {
+			// Slang reported success but returned a null out-pointer.
+			return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+		};
 		Ok(ByteCodeRunner {
-			inner: ByteCodeRunnerInner(IUnknown(std::ptr::NonNull::new(runner as *mut _).unwrap())),
+			inner: ByteCodeRunnerInner(IUnknown(runner)),
 			module_loaded: Arc::new(AtomicBool::new(false)),
 		})
 	}
@@ -3307,9 +3654,11 @@ pub fn disassemble_byte_code(module: &Blob) -> Result<Blob> {
 	if !succeeded(result) {
 		return Err(Error::Code(result));
 	}
-	Ok(Blob(IUnknown(
-		std::ptr::NonNull::new(disassembly as *mut _).unwrap(),
-	)))
+	let Some(disassembly) = std::ptr::NonNull::new(disassembly as *mut _) else {
+		// Slang reported success but returned a null out-pointer.
+		return Err(Error::Code(sys::SLANG_E_INVALID_ARG));
+	};
+	Ok(Blob(IUnknown(disassembly)))
 }
 
 /// Description of a code generation target (`slang::TargetDesc` in slang.h),
@@ -3326,6 +3675,12 @@ impl std::ops::Deref for TargetDesc<'_> {
 
 	fn deref(&self) -> &Self::Target {
 		&self.inner
+	}
+}
+
+impl std::fmt::Debug for TargetDesc<'_> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_tuple("TargetDesc").field(&self.inner).finish()
 	}
 }
 
@@ -3424,12 +3779,91 @@ impl PreprocessorMacroDesc {
 	}
 }
 
+impl std::fmt::Debug for PreprocessorMacroDesc {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("PreprocessorMacroDesc")
+			.field("name", &self._name)
+			.field("value", &self._value)
+			.finish()
+	}
+}
+
+/// Description of a Slang global session (`SlangGlobalSessionDesc` in
+/// slang.h), built with [`GlobalSessionDesc::default`] plus builder methods
+/// and passed to [`GlobalSession::new_with_desc`].
+#[repr(transparent)]
+pub struct GlobalSessionDesc {
+	inner: sys::SlangGlobalSessionDesc,
+}
+
+impl std::ops::Deref for GlobalSessionDesc {
+	type Target = sys::SlangGlobalSessionDesc;
+
+	fn deref(&self) -> &Self::Target {
+		&self.inner
+	}
+}
+
+impl std::fmt::Debug for GlobalSessionDesc {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_tuple("GlobalSessionDesc")
+			.field(&self.inner)
+			.finish()
+	}
+}
+
+impl Default for GlobalSessionDesc {
+	fn default() -> Self {
+		Self {
+			inner: sys::SlangGlobalSessionDesc {
+				structureSize: std::mem::size_of::<sys::SlangGlobalSessionDesc>() as _,
+				apiVersion: sys::SLANG_API_VERSION,
+				// `SLANG_LANGUAGE_VERSION_2025`, the slang.h default. The
+				// `SlangLanguageVersion` enum is not emitted by bindgen (its
+				// duplicate-valued deprecated aliases are not representable as
+				// a Rust enum), so the value is spelled out here.
+				minLanguageVersion: 2025,
+				// SAFETY: the remaining fields (`enableGLSL`, `reserved`) are
+				// scalars; all-zero is their slang.h default.
+				..unsafe { std::mem::zeroed() }
+			},
+		}
+	}
+}
+
+impl GlobalSessionDesc {
+	/// Sets the oldest Slang language version that any session created from
+	/// this global session will use (`minLanguageVersion` in slang.h; the
+	/// `SLANG_LANGUAGE_VERSION_*` values, e.g. `2025`).
+	pub fn min_language_version(mut self, version: u32) -> Self {
+		self.inner.minLanguageVersion = version;
+		self
+	}
+
+	/// Sets whether to enable GLSL support (`enableGLSL` in slang.h): loads
+	/// the GLSL builtin module so that GLSL source files can be imported as
+	/// modules. This is the global-session-level switch, distinct from the
+	/// legacy session-level [`SessionDesc::allow_glsl_syntax`] flag.
+	pub fn enable_glsl(mut self, enable: bool) -> Self {
+		self.inner.enableGLSL = enable;
+		self
+	}
+}
+
 /// Description of a Slang session (`slang::SessionDesc` in slang.h), built
 /// with [`SessionDesc::default`] plus builder methods and passed to
 /// [`GlobalSession::create_session`].
-#[repr(transparent)]
+///
+/// Not `repr(transparent)`: unlike [`TargetDesc`], this desc owns the search
+/// path strings (see [`SessionDesc::search_paths`]) in addition to the raw
+/// sys struct.
 pub struct SessionDesc<'a> {
 	inner: sys::slang_SessionDesc,
+	// Owns the search path strings and the pointer array `inner.searchPaths`
+	// points into. Moving this struct moves the `Vec`s/`CString`s but not
+	// their heap buffers, so the pointers stay valid.
+	search_paths: Vec<CString>,
+	search_path_ptrs: Vec<*const c_char>,
 	_phantom: PhantomData<&'a ()>,
 }
 
@@ -3438,6 +3872,12 @@ impl std::ops::Deref for SessionDesc<'_> {
 
 	fn deref(&self) -> &Self::Target {
 		&self.inner
+	}
+}
+
+impl std::fmt::Debug for SessionDesc<'_> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_tuple("SessionDesc").field(&self.inner).finish()
 	}
 }
 
@@ -3450,6 +3890,8 @@ impl Default for SessionDesc<'_> {
 				// pointers; an all-zero value is a valid instance.
 				..unsafe { std::mem::zeroed() }
 			},
+			search_paths: Vec::new(),
+			search_path_ptrs: Vec::new(),
 			_phantom: PhantomData,
 		}
 	}
@@ -3477,11 +3919,19 @@ impl<'a> SessionDesc<'a> {
 	}
 
 	/// Sets the paths used when searching for `#include`d or `import`ed
-	/// files, as NUL-terminated C string pointers.
-	pub fn search_paths(mut self, paths: &'a [*const i8]) -> Self {
-		self.inner.searchPaths = paths.as_ptr();
+	/// files. The desc takes ownership of the strings, so they stay valid for
+	/// the desc's lifetime. Returns `Err` when a path contains an interior
+	/// NUL byte (which cannot be represented in a C string).
+	pub fn search_paths(mut self, paths: &[&str]) -> Result<Self> {
+		let paths = paths
+			.iter()
+			.map(|path| cstring(path))
+			.collect::<Result<Vec<_>>>()?;
+		self.search_path_ptrs = paths.iter().map(|path| path.as_ptr()).collect();
+		self.inner.searchPaths = self.search_path_ptrs.as_ptr() as _;
 		self.inner.searchPathCount = paths.len() as _;
-		self
+		self.search_paths = paths;
+		Ok(self)
 	}
 
 	/// Sets global preprocessor definitions used for all code that gets
@@ -3547,18 +3997,20 @@ macro_rules! option {
 
 	($name:ident, $func:ident($p_name:ident: &str)) => {
 		/// Appends the corresponding [`CompilerOptionName`] option with a
-		/// string value.
+		/// string value. Returns `Err` when the value contains an interior
+		/// NUL byte (which cannot be represented in a C string).
 		#[inline(always)]
-		pub fn $func(self, $p_name: &str) -> Self {
+		pub fn $func(self, $p_name: &str) -> Result<Self> {
 			self.push_str1(CompilerOptionName::$name, $p_name)
 		}
 	};
 
 	($name:ident, $func:ident($p_name1:ident: &str, $p_name2:ident: &str)) => {
 		/// Appends the corresponding [`CompilerOptionName`] option with two
-		/// string values.
+		/// string values. Returns `Err` when a value contains an interior
+		/// NUL byte (which cannot be represented in a C string).
 		#[inline(always)]
-		pub fn $func(self, $p_name1: &str, $p_name2: &str) -> Self {
+		pub fn $func(self, $p_name1: &str, $p_name2: &str) -> Result<Self> {
 			self.push_str2(CompilerOptionName::$name, $p_name1, $p_name2)
 		}
 	};
@@ -3607,29 +4059,24 @@ impl CompilerOptions {
 		self
 	}
 
-	// NOTE: these string builders deliberately keep `unwrap` (rather than
-	// returning `Result`) so the `CompilerOptions` builder stays chainable
-	// (`.include(a).macro_define(b)...`). Option strings such as include paths
-	// and macro values are programmer-supplied and effectively never contain an
-	// interior NUL.
-	fn push_str1(mut self, name: CompilerOptionName, s0: &str) -> Self {
-		let s0 = CString::new(s0).unwrap();
+	fn push_str1(mut self, name: CompilerOptionName, s0: &str) -> Result<Self> {
+		let s0 = cstring(s0)?;
 		let s0_ptr = s0.as_ptr();
 		self.strings.push(s0);
 
-		self.push_strings(name, s0_ptr, null())
+		Ok(self.push_strings(name, s0_ptr, null()))
 	}
 
-	fn push_str2(mut self, name: CompilerOptionName, s0: &str, s1: &str) -> Self {
-		let s0 = CString::new(s0).unwrap();
+	fn push_str2(mut self, name: CompilerOptionName, s0: &str, s1: &str) -> Result<Self> {
+		let s0 = cstring(s0)?;
 		let s0_ptr = s0.as_ptr();
 		self.strings.push(s0);
 
-		let s1 = CString::new(s1).unwrap();
+		let s1 = cstring(s1)?;
 		let s1_ptr = s1.as_ptr();
 		self.strings.push(s1);
 
-		self.push_strings(name, s0_ptr, s1_ptr)
+		Ok(self.push_strings(name, s0_ptr, s1_ptr))
 	}
 }
 
@@ -3649,14 +4096,16 @@ impl CompilerOptions {
 
 	/// Escape hatch: appends a single-string entry for any
 	/// [`CompilerOptionName`], including the many options that have no
-	/// dedicated builder method.
-	pub fn set_string(self, name: CompilerOptionName, value: &str) -> Self {
+	/// dedicated builder method. Returns `Err` when the value contains an
+	/// interior NUL byte.
+	pub fn set_string(self, name: CompilerOptionName, value: &str) -> Result<Self> {
 		self.push_str1(name, value)
 	}
 
 	/// Escape hatch: appends a two-string entry for any
-	/// [`CompilerOptionName`] that takes two string values.
-	pub fn set_strings(self, name: CompilerOptionName, value0: &str, value1: &str) -> Self {
+	/// [`CompilerOptionName`] that takes two string values. Returns `Err`
+	/// when a value contains an interior NUL byte.
+	pub fn set_strings(self, name: CompilerOptionName, value0: &str, value1: &str) -> Result<Self> {
 		self.push_str2(name, value0, value1)
 	}
 }
@@ -3711,3 +4160,35 @@ impl CompilerOptions {
 	option!(NoMangle, no_mangle(enable: bool));
 	option!(ValidateUniformity, validate_uniformity(enable: bool));
 }
+
+impl std::fmt::Debug for CompilerOptions {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_tuple("CompilerOptions")
+			.field(&self.options)
+			.finish()
+	}
+}
+
+com_wrapper_debug!(
+	IUnknown,
+	Blob,
+	SharedLibrary,
+	Clonable,
+	Writer,
+	Profiler,
+	MutableFileSystem,
+	GlobalSession,
+	Session,
+	Metadata,
+	CompileResult,
+	ComponentType2,
+	BindlessResourceMetadata,
+	CoverageTracingMetadata,
+	SyntheticResourceMetadata,
+	CooperativeTypesMetadata,
+	ComponentType,
+	EntryPoint,
+	TypeConformance,
+	Module,
+	ModulePrecompileService,
+);

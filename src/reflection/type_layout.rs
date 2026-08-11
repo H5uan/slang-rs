@@ -433,4 +433,12 @@ impl TypeLayout {
 				as Option<&VariableLayout>
 		)
 	}
+
+	// Note: the remaining sub-object-range accessors declared in
+	// slang-deprecated.h (`..._getSubObjectRangeObjectCount`,
+	// `..._getSubObjectRangeTypeLayout`, and the five
+	// `..._getSubObjectRangeDescriptorRange*` functions) are inside `#if 0`
+	// blocks in both slang-deprecated.h and slang-reflection-api.cpp at Slang
+	// v2026.14.1, so they are not exported by the Slang binaries and cannot
+	// be bound.
 }

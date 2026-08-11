@@ -52,6 +52,22 @@ cargo run --example host_callable
 cargo run --example virtual_file_system
 ```
 
+## Scope / non-goals
+
+These bindings cover Slang's compilation and reflection APIs. The following
+parts of the Slang API surface are **not currently wrapped** — open an issue
+if you need them:
+
+- `slang-gfx.h` — a separate GPU abstraction layer, independent of the
+  compiler API.
+- `ICompileRequest` and the deprecated `sp*` compile-request API
+  (slang-deprecated.h) — superseded by the `ISession` / `IComponentType`
+  pipeline this crate wraps. Note the `spReflection*` reflection functions
+  **are** in scope; only the deprecated compile-request API is excluded.
+- The raw-pointer/callback-driven `IByteCodeRunner` methods (`execute`,
+  `registerExtCall`, `getReturnValue`, ...) — see the `ByteCodeRunner` docs.
+- `ISharedLibraryLoader`.
+
 ## Installation
 
 ### Default: automatic download

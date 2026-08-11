@@ -4,8 +4,6 @@ use crate as slang;
 fn compile() {
 	let global_session = slang::GlobalSession::new().unwrap();
 
-	let search_path = std::ffi::CString::new("shaders").unwrap();
-
 	// All compiler options are available through this builder.
 	let session_options = slang::CompilerOptions::default()
 		.optimization(slang::OptimizationLevel::High)
@@ -16,11 +14,11 @@ fn compile() {
 		.profile(global_session.find_profile("glsl_450"));
 
 	let targets = [target_desc];
-	let search_paths = [search_path.as_ptr()];
 
 	let session_desc = slang::SessionDesc::default()
 		.targets(&targets)
-		.search_paths(&search_paths)
+		.search_paths(&["shaders"])
+		.unwrap()
 		.options(&session_options);
 
 	let session = global_session.create_session(&session_desc).unwrap();
@@ -42,10 +40,47 @@ fn compile() {
 	assert_ne!(shader_bytecode.as_slice().len(), 0);
 }
 
+#[test]
+fn debug_formats() {
+	// COM wrappers print as `Name(0x...)` without calling into Slang.
+	let global_session = slang::GlobalSession::new().unwrap();
+	assert!(format!("{global_session:?}").starts_with("GlobalSession(0x"));
+
+	let blob = slang::Blob::new(b"hello");
+	assert!(format!("{blob:?}").starts_with("Blob(0x"));
+
+	// Reflection wrappers print the same way.
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let reflection = linked_program.layout(0).unwrap();
+	assert!(format!("{reflection:?}").starts_with("Shader(0x"));
+	let reflection_entry_point = reflection.entry_points().next().unwrap();
+	assert!(format!("{reflection_entry_point:?}").starts_with("EntryPoint(0x"));
+
+	// Desc/builder structs print their contents.
+	assert!(format!("{:?}", slang::SessionDesc::default()).starts_with("SessionDesc("));
+	assert!(format!("{:?}", slang::CompilerOptions::default()).starts_with("CompilerOptions("));
+	assert!(format!("{:?}", slang::TargetDesc::default()).starts_with("TargetDesc("));
+
+	// `search_paths` rejects interior NUL bytes.
+	assert!(
+		slang::SessionDesc::default()
+			.search_paths(&["bad\0path"])
+			.is_err()
+	);
+}
+
 /// A cached global session that is never dropped, to avoid triggering Slang's
 /// global state cleanup on macOS (which can cause a flaky SIGBUS during
-/// process exit). The session is `Box::leak`ed so it lives for the entire
-/// process and is never destroyed.
+/// process exit — an upstream Slang teardown bug, not a binding bug; no
+/// matching upstream issue found as of 2026-08, see
+/// <https://github.com/shader-slang/slang/issues?q=SIGBUS>). The session is
+/// `Box::leak`ed so it lives for the entire process and is never destroyed.
 ///
 /// `GlobalSession` is deliberately `!Sync` (Slang's global session is not
 /// thread-safe), so the cached value cannot be stored in a static directly.
@@ -87,18 +122,16 @@ impl LeakedGlobalSession {
 fn create_test_session() -> slang::Session {
 	let global_session = global_session();
 
-	let search_path = std::ffi::CString::new("shaders").unwrap();
-
 	let target_desc = slang::TargetDesc::default()
 		.format(slang::CompileTarget::Spirv)
 		.profile(global_session.find_profile("glsl_450"));
 
 	let targets = [target_desc];
-	let search_paths = [search_path.as_ptr()];
 
 	let session_desc = slang::SessionDesc::default()
 		.targets(&targets)
-		.search_paths(&search_paths);
+		.search_paths(&["shaders"])
+		.unwrap();
 
 	global_session.create_session(&session_desc).unwrap()
 }
@@ -309,7 +342,7 @@ float foo(float z, float x = 1.5, int y = 42) { return x + y + z; }
 	let program = slang::ComponentType::from(module);
 	let reflection = program.layout(0).unwrap();
 
-	let foo = reflection.find_function_by_name("foo").unwrap();
+	let foo = reflection.find_function_by_name("foo").unwrap().unwrap();
 	let z = foo.parameter_by_index(0).unwrap();
 	let x = foo.parameter_by_index(1).unwrap();
 	let y = foo.parameter_by_index(2).unwrap();
@@ -403,7 +436,7 @@ float foo(float x) { return x; }
 	let program = slang::ComponentType::from(module);
 	let reflection = program.layout(0).unwrap();
 
-	let foo = reflection.find_function_by_name("foo").unwrap();
+	let foo = reflection.find_function_by_name("foo").unwrap().unwrap();
 	assert!(foo.is_overloaded());
 	assert_eq!(foo.overload_count(), 2);
 
@@ -601,7 +634,7 @@ fn component_type_link_with_options_and_friends() {
 	assert!(!code.as_slice().is_empty());
 
 	// The hash blob is a non-empty dependency hash usable as a cache key.
-	let hash = linked_program.entry_point_hash(0, 0);
+	let hash = linked_program.entry_point_hash(0, 0).unwrap();
 	assert!(!hash.as_slice().is_empty());
 
 	// A component type hands out its owning session, which stays usable.
@@ -1968,11 +2001,10 @@ fn multi_target_compilation() {
 	let targets = [spirv, dxil];
 
 	// Rebuild the session with both targets.
-	let search_path = std::ffi::CString::new("shaders").unwrap();
-	let search_paths = [search_path.as_ptr()];
 	let session_desc = slang::SessionDesc::default()
 		.targets(&targets)
-		.search_paths(&search_paths);
+		.search_paths(&["shaders"])
+		.unwrap();
 	let session = gs.create_session(&session_desc).unwrap();
 
 	let module = session.load_module("test.slang").unwrap();
@@ -2063,17 +2095,18 @@ fn compiler_options_comprehensive() {
 		.capability(capability)
 		.language(slang::SourceLanguage::Slang)
 		.macro_define("TEST_MACRO", "42")
-		.include(".");
+		.unwrap()
+		.include(".")
+		.unwrap();
 
-	let search_path = std::ffi::CString::new(".").unwrap();
-	let search_paths = [search_path.as_ptr()];
 	let target_desc = slang::TargetDesc::default()
 		.format(slang::CompileTarget::Spirv)
 		.profile(profile);
 	let targets = [target_desc];
 	let session_desc = slang::SessionDesc::default()
 		.targets(&targets)
-		.search_paths(&search_paths)
+		.search_paths(&["."])
+		.unwrap()
 		.options(&options);
 	let session = gs.create_session(&session_desc).unwrap();
 
@@ -2098,10 +2131,10 @@ fn rename_entry_point_and_hash() {
 	let module = session.load_module("test.slang").unwrap();
 	let entry_point = module.find_entry_point_by_name("main").unwrap();
 	let comp: slang::ComponentType = entry_point.into();
-	let hash_before = comp.entry_point_hash(0, 0);
+	let hash_before = comp.entry_point_hash(0, 0).unwrap();
 
 	let renamed = comp.rename_entry_point("renamed_main").unwrap();
-	let hash_after = renamed.entry_point_hash(0, 0);
+	let hash_after = renamed.entry_point_hash(0, 0).unwrap();
 	assert_ne!(
 		hash_before.as_slice(),
 		hash_after.as_slice(),
@@ -2202,15 +2235,21 @@ fn spirv_validation() {
 // ---------------------------------------------------------------------------
 // Thread-safety soundness tests
 //
-// The binding deliberately marks `IUnknown` as neither `Send` nor `Sync`
-// (Slang documents that "a global session and the objects created from it"
-// are not thread-safe). Only the genuinely immutable, read-only wrappers
-// [`Blob`] and [`Metadata`] opt back in. These tests lock in that contract.
+// Per slang.h, "a global session and the objects created from it" must be
+// externally synchronized when shared across threads, but "distinct global
+// sessions may be used from different threads in parallel". The COM
+// wrappers are therefore `Send` (movable with exclusive ownership) but not
+// `Sync`; only the immutable [`Blob`] and [`Metadata`] are `Send + Sync`.
+// These tests lock in that contract.
 // ---------------------------------------------------------------------------
 
 /// Compile-time assertion that `T` is both `Send` and `Sync`. Calling this
 /// with a type that is not `Send + Sync` is a compile error.
 fn assert_send_sync<T: Send + Sync>() {}
+
+/// Compile-time assertion that `T` is `Send`. Calling this with a type
+/// that is not `Send` is a compile error.
+fn assert_send<T: Send>() {}
 
 #[test]
 fn thread_safety_immutable_wrappers_are_send_sync() {
@@ -2224,28 +2263,69 @@ fn thread_safety_immutable_wrappers_are_send_sync() {
 }
 
 #[test]
+fn thread_safety_wrappers_are_send() {
+	// Every COM wrapper is `Send`: slang.h allows an object to move between
+	// threads as long as it is only used from one thread at a time
+	// ("distinct global sessions may be used from different threads in
+	// parallel"). None of them is `Sync` — sharing `&T` across threads
+	// still requires the caller's external synchronization.
+	assert_send::<slang::GlobalSession>();
+	assert_send::<slang::Session>();
+	assert_send::<slang::Module>();
+	assert_send::<slang::ComponentType>();
+	assert_send::<slang::EntryPoint>();
+	assert_send::<slang::TypeConformance>();
+	assert_send::<slang::ComponentType2>();
+	assert_send::<slang::CompileResult>();
+	assert_send::<slang::SharedLibrary>();
+	assert_send::<slang::Clonable>();
+	assert_send::<slang::Writer>();
+	assert_send::<slang::Profiler>();
+	assert_send::<slang::MutableFileSystem>();
+	assert_send::<slang::FileSystemObject>();
+	assert_send::<slang::ModulePrecompileService>();
+	assert_send::<slang::ByteCodeRunner>();
+	assert_send::<slang::BindlessResourceMetadata>();
+	assert_send::<slang::CoverageTracingMetadata>();
+	assert_send::<slang::SyntheticResourceMetadata>();
+	assert_send::<slang::CooperativeTypesMetadata>();
+	assert_send::<slang::Blob>();
+	assert_send::<slang::Metadata>();
+}
+
+#[test]
 fn thread_safety_concurrent_sessions_compile_in_parallel() {
 	// Slang's documented contract: "Distinct global sessions may be used from
-	// different threads in parallel." Each thread builds its own session (it
-	// must, because a session is `!Send`/`!Sync`) and compiles the same shader.
-	// The compiled `Blob` results are `Send + Sync`, so they can be collected
-	// back onto the spawning thread and validated.
+	// different threads in parallel." The wrappers are `Send`, so each
+	// thread's global session and session are built up front and moved into
+	// the scoped threads, where they compile the same shader. The compiled
+	// `Blob` results are `Send + Sync`, so they can be collected back onto
+	// the spawning thread and validated.
 	const THREADS: usize = 4;
+	let sessions: Vec<(slang::GlobalSession, slang::Session)> = (0..THREADS)
+		.map(|_| {
+			let global_session = slang::GlobalSession::new().unwrap();
+			let target_desc = slang::TargetDesc::default()
+				.format(slang::CompileTarget::Spirv)
+				.profile(global_session.find_profile("glsl_450"));
+			let targets = [target_desc];
+			let session_desc = slang::SessionDesc::default()
+				.targets(&targets)
+				.search_paths(&["shaders"])
+				.unwrap();
+			let session = global_session.create_session(&session_desc).unwrap();
+			(global_session, session)
+		})
+		.collect();
+
 	let results: Vec<slang::Blob> = std::thread::scope(|scope| {
-		let handles: Vec<_> = (0..THREADS)
-			.map(|_| {
-				scope.spawn(|| {
-					let global_session = slang::GlobalSession::new().unwrap();
-					let search_path = std::ffi::CString::new("shaders").unwrap();
-					let target_desc = slang::TargetDesc::default()
-						.format(slang::CompileTarget::Spirv)
-						.profile(global_session.find_profile("glsl_450"));
-					let targets = [target_desc];
-					let search_paths = [search_path.as_ptr()];
-					let session_desc = slang::SessionDesc::default()
-						.targets(&targets)
-						.search_paths(&search_paths);
-					let session = global_session.create_session(&session_desc).unwrap();
+		let handles: Vec<_> = sessions
+			.into_iter()
+			.map(|pair| {
+				scope.spawn(move || {
+					// Locals drop in reverse declaration order: `session` is
+					// released before its global session.
+					let (_global_session, session) = pair;
 					let module = session.load_module("test.slang").unwrap();
 					let entry_point = module.find_entry_point_by_name("main").unwrap();
 					let program = session
@@ -2303,6 +2383,58 @@ fn nul_input_result_methods_return_error() {
 	);
 	assert!(slang::PreprocessorMacroDesc::new("M\0", "1").is_err());
 	assert!(slang::SpecializationArg::from_expr("fl\0oat").is_err());
+
+	// The CompilerOptions string builders are fallible as well.
+	assert!(
+		slang::CompilerOptions::default()
+			.macro_define("M\0", "1")
+			.is_err()
+	);
+	assert!(
+		slang::CompilerOptions::default()
+			.include("bad\0path")
+			.is_err()
+	);
+	assert!(
+		slang::CompilerOptions::default()
+			.set_strings(slang::CompilerOptionName::MacroDefine, "A", "1\0")
+			.is_err()
+	);
+}
+
+#[test]
+fn nul_input_reflection_finders_return_error() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let reflection = linked_program.layout(0).unwrap();
+
+	// The reflection finders return `Result` and surface an interior NUL as
+	// an error rather than panicking.
+	assert!(reflection.find_type_parameter_by_name("T\0").is_err());
+	assert!(reflection.find_entry_point_by_name("ma\0in").is_err());
+	assert!(reflection.find_type_by_name("fl\0oat").is_err());
+	assert!(reflection.find_function_by_name("ma\0in").is_err());
+
+	let param = reflection.parameter_by_index(0).unwrap();
+	assert!(
+		param
+			.variable()
+			.unwrap()
+			.find_user_attribute_by_name(global_session(), "a\0")
+			.is_err()
+	);
+	assert!(
+		param
+			.ty()
+			.unwrap()
+			.find_user_attribute_by_name("a\0")
+			.is_err()
+	);
 }
 
 #[test]
@@ -2317,4 +2449,163 @@ fn nul_input_find_methods_fall_back_to_not_found() {
 	let module = session.load_module("test.slang").unwrap();
 	assert!(module.find_entry_point_by_name("mai\0n").is_none());
 	assert!(!session.is_binary_module_up_to_date("test\0.slang", &slang::Blob::new(&[1, 2, 3])));
+}
+
+#[test]
+fn error_code_display() {
+	// `SLANG_FAIL`; a named constant.
+	let error = slang::Error::Code(0x80004005u32 as i32);
+	assert_eq!(format!("{error}"), "Slang error 0x80004005 (SLANG_FAIL)");
+
+	// `SLANG_E_NOT_FOUND`; a named constant.
+	let error = slang::Error::Code(0x82000005u32 as i32);
+	assert_eq!(
+		format!("{error}"),
+		"Slang error 0x82000005 (SLANG_E_NOT_FOUND)"
+	);
+
+	// A code without a known name falls back to the bare hex value.
+	let error = slang::Error::Code(0x8000ffffu32 as i32);
+	assert_eq!(format!("{error}"), "Slang error 0x8000ffff");
+}
+
+#[test]
+fn last_internal_error_message_smoke() {
+	// No internal error is expected on this thread; the point is that the
+	// wrapper is safe to call at any time and copies the thread-local message.
+	let _ = slang::last_internal_error_message();
+}
+
+#[test]
+fn global_session_desc_enable_glsl() {
+	let desc = slang::GlobalSessionDesc::default().enable_glsl(true);
+	let global_session = slang::GlobalSession::new_with_desc(&desc).unwrap();
+
+	let target_desc = slang::TargetDesc::default()
+		.format(slang::CompileTarget::Spirv)
+		.profile(global_session.find_profile("glsl_450"));
+	let targets = [target_desc];
+	let session_desc = slang::SessionDesc::default().targets(&targets);
+	let session = global_session.create_session(&session_desc).unwrap();
+
+	// With GLSL enabled at the global-session level, a GLSL source file can be
+	// imported as a module and compiled to SPIR-V.
+	let source = r#"
+#version 450
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Data { float values[]; };
+void main() { values[gl_GlobalInvocationID.x] = 1.0; }
+"#;
+
+	let module = session
+		.load_module_from_source_string("glsl_test", "glsl_test.glsl", source)
+		.unwrap();
+	// GLSL entry points are not registered as `[shader]`-attributed defined
+	// entry points; they are resolved with an explicit stage (same pattern as
+	// Slang's own unit-test-glsl-compile.cpp).
+	let entry_point = module
+		.find_and_check_entry_point("main", slang::Stage::Compute)
+		.unwrap();
+
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+
+	let code = linked_program.entry_point_code(0, 0).unwrap();
+	assert!(!code.as_slice().is_empty());
+}
+
+#[test]
+fn function_as_decl() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let reflection = linked_program.layout(0).unwrap();
+
+	let function = reflection.find_function_by_name("main").unwrap().unwrap();
+	assert_eq!(function.name(), Some("main"));
+
+	let decl = function.as_decl().unwrap();
+	assert_eq!(decl.name(), Some("main"));
+}
+
+#[test]
+fn specialized_type_args() {
+	let session = create_test_session();
+
+	let source = r#"
+interface IValue
+{
+	int get();
+}
+
+struct ConstantA : IValue
+{
+	int get() { return 1; }
+}
+"#;
+
+	let module = session
+		.load_module_from_source_string(
+			"specialized_type_args",
+			"specialized_type_args.slang",
+			source,
+		)
+		.unwrap();
+	let module_decl = module.module_reflection();
+
+	let find_type = |name: &str| {
+		module_decl
+			.children()
+			.find(|d| d.name() == Some(name))
+			.unwrap()
+			.ty()
+			.unwrap()
+	};
+	let interface_type = find_type("IValue");
+	let impl_type = find_type("ConstantA");
+
+	// A plain type is not a specialization.
+	assert_eq!(impl_type.specialized_type_arg_count(), 0);
+
+	let specialized = session
+		.specialize_type(
+			interface_type,
+			&[slang::SpecializationArg::from_type(impl_type)],
+		)
+		.unwrap();
+	assert_eq!(specialized.kind(), slang::TypeKind::Specialized);
+	assert_eq!(specialized.specialized_type_arg_count(), 1);
+	assert_eq!(
+		specialized.specialized_type_arg_type(0).unwrap().name(),
+		Some("ConstantA")
+	);
+}
+
+#[test]
+fn shader_reflection_session() {
+	let session = create_test_session();
+	let module = session.load_module("test.slang").unwrap();
+	let entry_point = module.find_entry_point_by_name("main").unwrap();
+
+	let program = session
+		.create_composite_component_type(&[module.into(), entry_point.into()])
+		.unwrap();
+	let linked_program = program.link().unwrap();
+	let reflection = linked_program.layout(0).unwrap();
+
+	let reflected_session = reflection.session().unwrap();
+
+	// The returned session holds its own reference: it stays valid (and can
+	// be dropped) after the program and the original session are gone.
+	drop(linked_program);
+	drop(program);
+	drop(session);
+	drop(reflected_session);
 }

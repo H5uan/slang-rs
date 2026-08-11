@@ -50,15 +50,14 @@ fn create_global_session() -> Option<slang::GlobalSession> {
 #[divan::bench]
 fn create_session() -> slang::Session {
 	let gs = global_session();
-	let search_path = std::ffi::CString::new("shaders").unwrap();
-	let search_paths = [search_path.as_ptr()];
 	let target_desc = slang::TargetDesc::default()
 		.format(slang::CompileTarget::Spirv)
 		.profile(gs.find_profile("glsl_450"));
 	let targets = [target_desc];
 	let session_desc = slang::SessionDesc::default()
 		.targets(&targets)
-		.search_paths(&search_paths);
+		.search_paths(&["shaders"])
+		.unwrap();
 	gs.create_session(&session_desc).unwrap()
 }
 

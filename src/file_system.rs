@@ -206,6 +206,19 @@ unsafe impl Interface for FileSystemObject {
 	const IID: UUID = uuid(0x003a_09fc_3a4d_4ba0_ad60_1fd8_63a9_15ab);
 }
 
+// SAFETY: the backing Rust implementation is `Send + Sync` (a `FileSystem`
+// supertrait bound) and the reference count is atomic, so the wrapper may
+// move between threads with exclusive ownership. `Sync` is deliberately
+// not implemented, matching the other COM wrappers (a session using this
+// object must be externally synchronized per slang.h anyway).
+unsafe impl Send for FileSystemObject {}
+
+impl std::fmt::Debug for FileSystemObject {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "FileSystemObject({:p})", self.as_unknown())
+	}
+}
+
 impl FileSystemObject {
 	/// Wraps a [`FileSystem`] implementation in a COM object that can be
 	/// passed to Slang. The object answers `queryInterface` for

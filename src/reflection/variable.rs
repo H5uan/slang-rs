@@ -1,5 +1,5 @@
 use super::{Generic, Type, UserAttribute, rcall};
-use crate::{GlobalSession, Interface, Modifier, ModifierID, succeeded, sys};
+use crate::{GlobalSession, Interface, Modifier, ModifierID, Result, cstring, succeeded, sys};
 
 /// Reflection of a variable, such as a struct field, function parameter, or
 /// global.
@@ -41,8 +41,9 @@ impl Variable {
 		(0..self.user_attribute_count()).map(|i| self.user_attribute_by_index(i).unwrap())
 	}
 
-	/// Finds a user-defined attribute by name, returning `None` if the variable
-	/// has no attribute with that name.
+	/// Finds a user-defined attribute by name, returning `Ok(None)` if the
+	/// variable has no attribute with that name. Returns `Err` when `name`
+	/// contains an interior NUL byte.
 	///
 	/// `global_session` must be the global session that produced this
 	/// reflection.
@@ -50,13 +51,13 @@ impl Variable {
 		&self,
 		global_session: &GlobalSession,
 		name: &str,
-	) -> Option<&UserAttribute> {
-		let name = std::ffi::CString::new(name).unwrap();
-		rcall!(spReflectionVariable_FindUserAttributeByName(
+	) -> Result<Option<&UserAttribute>> {
+		let name = cstring(name)?;
+		Ok(rcall!(spReflectionVariable_FindUserAttributeByName(
 			self,
 			global_session.as_raw(),
 			name.as_ptr()
-		) as Option<&UserAttribute>)
+		) as Option<&UserAttribute>))
 	}
 
 	/// Returns whether the variable has a default value.

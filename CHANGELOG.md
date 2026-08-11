@@ -5,6 +5,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Error diagnostics and global session options
+
+- `Error::Code` now formats as hex plus the known `SLANG_*` constant name (e.g. `Slang error 0x80004005 (SLANG_FAIL)`) instead of a bare decimal.
+- New `last_internal_error_message` free function (`slang_getLastInternalErrorMessage`): the last internal error signaled by Slang on the calling thread, as an owned copy.
+- New `GlobalSessionDesc` builder (`SlangGlobalSessionDesc`) and `GlobalSession::new_with_desc` (`slang_createGlobalSession2`), exposing the global-session-level options `enable_glsl` (loads the GLSL builtin module so GLSL sources can be imported as modules — distinct from the legacy session-level `SessionDesc::allow_glsl_syntax` flag) and `min_language_version`.
+
+### Reflection additions
+
+- `Type::specialized_type_arg_count` / `specialized_type_arg_type` (`spReflectionType_getSpecializedTypeArgCount` / `...Type`).
+- `Function::as_decl` (`spReflectionFunction_asDecl`).
+- `Shader::session` (`spReflection_GetSession`): returns an owned `Session` (the C function hands out a borrowed reference, which the wrapper `addRef`s).
+- Not bindable: the remaining `TypeLayout` sub-object-range accessors (`getSubObjectRangeObjectCount`, `getSubObjectRangeTypeLayout`, and the five `getSubObjectRangeDescriptorRange*` functions) are inside `#if 0` blocks in both slang-deprecated.h and slang-reflection-api.cpp at Slang v2026.14.1 and are not exported by the Slang binaries.
+
+### Documentation
+
+- README and crate-level docs now declare the scope/non-goals: `slang-gfx.h`, `ICompileRequest` + the deprecated `sp*` compile-request API (the `spReflection*` reflection API remains in scope), the raw-pointer/callback-driven `IByteCodeRunner` methods, and `ISharedLibraryLoader` are not wrapped.
+
+### Safety and correctness fixes
+
+- `Blob::as_slice` no longer risks undefined behavior on empty blobs with a null buffer pointer (`slang_createBlob` returns null for empty input); it returns an empty slice instead.
+- `Writer::begin_append_buffer` / `Writer::end_append_buffer` are now `unsafe`, reflecting the C contract: the caller must not write past the requested `max_num_chars` and must pass the exact buffer returned by `begin_append_buffer` back to `end_append_buffer`.
+- Result-returning wrappers no longer panic when Slang reports success but hands back a null out-pointer; they return `Err(Error::Code(SLANG_E_INVALID_ARG))` instead. This covers `MutableFileSystem`'s path management methods, the core/builtin module serializers, component-type composition/linking/code/metadata accessors, `CompileResult`, `Module::serialize` / `find_and_check_entry_point` / `disassemble`, `ModulePrecompileService::precompiled_target_code`, `ByteCodeRunner::new`, and `disassemble_byte_code`. `ComponentType::entry_point_hash` is now fallible (`Result<Blob>`) for the same reason.
+- Threading model aligned with slang.h ("distinct global sessions may be used from different threads in parallel"): all COM wrappers — `GlobalSession`, `Session`, `Module`, `ComponentType`, `EntryPoint`, `TypeConformance`, `ComponentType2`, `CompileResult`, `SharedLibrary`, `Clonable`, `Writer`, `Profiler`, `MutableFileSystem`, `FileSystemObject`, `ModulePrecompileService`, `ByteCodeRunner`, and the metadata extension interfaces — are now `Send` (movable between threads with exclusive ownership). None are `Sync` except the immutable `Blob` / `Metadata`; sharing an object across threads still requires external synchronization per slang.h.
+- Consistent interior-NUL handling: the `CompilerOptions` string builders (`macro_define`, `include`, `warnings_as_errors`, `disable_warnings`, `enable_warning`, `disable_warning`, `set_string`, `set_strings`) and the reflection finders (`Shader::find_type_parameter_by_name` / `find_entry_point_by_name` / `find_type_by_name` / `find_function_by_name` / `find_function_by_name_in_type` / `find_var_by_name_in_type`, `Type` / `Variable` / `Function::find_user_attribute_by_name`) now return `Result` and report an interior NUL byte as a `SLANG_E_INVALID_ARG` error instead of panicking.
+
+### Ergonomics
+
+- `SessionDesc::search_paths` now takes `&[&str]` and owns the strings (stored as `CString`s inside the desc, following the `PreprocessorMacroDesc` precedent) instead of borrowing `&[*const i8]` raw C-string pointers; callers no longer juggle `CString` lifetimes. It returns `Result`, reporting an interior NUL byte as `SLANG_E_INVALID_ARG`. `SessionDesc` is no longer `repr(transparent)` for this reason (it still `Deref`s to `sys::slang_SessionDesc`).
+- `Debug` impls across the public API surface: the COM wrappers (`IUnknown`, `GlobalSession`, `Session`, `Module`, `ComponentType`, `EntryPoint`, `Blob`, `Metadata`, `CompileResult`, `FileSystemObject`, etc.) print as `Name(0x...)` (the interface pointer, without calling into Slang), the `reflection` wrappers likewise, and the desc/builder/info structs (`SessionDesc`, `TargetDesc`, `GlobalSessionDesc`, `PreprocessorMacroDesc`, `CompilerOptions`, `ParsedCommandLine`, `SpecializationArg`, `SourceLocation`, `ModuleInfo`, `CoverageEntryInfo`, `CoverageBufferInfo`, `SyntheticResourceInfo`, `ProfileID`, `CapabilityID`) print their contents.
+
 ## [0.2.0] - 2026-08-09
 
 ### Remaining misc capabilities
