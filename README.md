@@ -58,7 +58,8 @@ cargo run --example virtual_file_system
 
 The build script downloads the prebuilt Slang v2026.14.1 binaries for your
 platform from the [releases page](https://github.com/shader-slang/slang/releases)
-and caches them in `target/slang-bin`. Runtime libraries are copied next to
+and caches them in `target/slang-bin/v<version>` (keyed on the Slang version, so
+a version bump never reuses stale binaries). Runtime libraries are copied next to
 your executables, so `cargo build` / `cargo test` / `cargo run` work out of the
 box.
 

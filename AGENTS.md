@@ -15,12 +15,12 @@ shader-slang-rs 是 [Slang 着色器语言编译器](https://github.com/shader-s
 - `shaders/test.slang` — 测试用 shader。
 - `.github/workflows/ci.yml` — CI:windows/ubuntu/macos(aarch64)三平台跑 fmt/clippy/test;不拉取 slang/ 子模块(走预编译包)。
 - `slang/` — Slang 源码 git submodule,pin 在 v2026.14.1 tag。**不要修改其内容**(包括其中的 `.claude/`、`CLAUDE.md`,那是上游仓库的文件)。
-- `target/reference/`、`target/slang-bin/` — 本地参考克隆和预编译库缓存,已 gitignore,**不要提交**。
+- `target/reference/`、`target/slang-bin/` — 本地参考克隆和预编译库缓存(按 `target/slang-bin/v<版本>/` 分版本存放),已 gitignore,**不要提交**。
 
 ## 构建与测试
 
 ```bash
-cargo test --workspace          # 默认:自动下载 v2026.14.1 预编译库(缓存到 target/slang-bin)
+cargo test --workspace          # 默认:自动下载 v2026.14.1 预编译库(缓存到 target/slang-bin/v2026.14.1)
 cargo test --features source-build   # 改用 cmake 构建 slang/ 子模块(首次需数十分钟)
 ```
 
@@ -32,6 +32,12 @@ cargo test --features source-build   # 改用 cmake 构建 slang/ 子模块(首�
 ## 约定
 
 - 代码风格:tab 缩进(见 `rustfmt.toml`,`hard_tabs = true`)。
-- **升级 Slang 版本时**,手写 vtable 必须与新版本 `slang.h` 逐方法核对(顺序、签名;Slang 只在接口末尾追加方法)。同时更新 `shader-slang-rs-sys/build.rs` 中的 `SLANG_VERSION`、slang/ 子模块 tag 和 `shader-slang-rs-sys/src/lib.rs` 顶部的版本注释。
+- **升级 Slang 版本时**,手写 vtable 必须与新版本 `slang.h` 逐方法核对(顺序、签名;Slang 只在接口末尾追加方法)。版本号的单一来源是 `shader-slang-rs-sys/build.rs` 中的 `SLANG_VERSION`,升级清单:
+  1. `shader-slang-rs-sys/build.rs` 的 `SLANG_VERSION`(canonical);
+  2. slang/ 子模块 checkout 到新 tag(`git submodule update` 后核对 `git -C slang describe --tags`);
+  3. `shader-slang-rs-sys/src/lib.rs` 顶部的 `// Based on Slang version ...` 注释(有 guard 测试校对);
+  4. 逐方法核对手写 vtable 与各接口方法数常量(`*_METHODS`),`vtable_method_counts_match_slang_h` 与 vtable 大小 assert 会兜底;
+  5. 重新生成签名快照:`SLANG_UPDATE_VTABLE_SNAPSHOT=1 cargo test -p shader-slang-rs-sys`,然后 review `shader-slang-rs-sys/tests/vtable_signatures.snap` 的 diff(快照头的版本号也有 guard 测试校对);
+  6. 散文提及:`README.md`(标题、Installation、仓库结构表、Acknowledgments)、`shader-slang-rs-sys/README.md` 标题行和 `src/lib.rs` 顶部 doc comment 中的 `v2026.14.1`(grep 全仓库 `2026.14.1` 兜底;行为注释如 `src/lib.rs` 中的 loaded-state guard 若仍成立可保留)。
 - 高层 API 以 FloatyMonkey/slang-rs 为起点,能力面对齐 Slang v2026.14.1;新增 Slang 能力的封装应保持其风格(`vcall!`/`rcall!` 宏、`repr(transparent)` 包装)。
 - 变更后运行 `cargo test --workspace` 验证。

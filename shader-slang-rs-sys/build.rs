@@ -4,8 +4,11 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The Slang release this crate binds against. The handwritten vtables in
-/// `src/lib.rs` must match this version's `slang.h` exactly.
+/// The Slang release this crate binds against. This is the canonical Slang
+/// version for the whole workspace; the version comment at the top of
+/// `src/lib.rs` and the vtable signature snapshot header are checked against
+/// it by tests. The handwritten vtables in `src/lib.rs` must match this
+/// version's `slang.h` exactly.
 const SLANG_VERSION: &str = "2026.14.1";
 
 fn main() {
@@ -114,10 +117,14 @@ fn main() {
 		.expect("Couldn't write bindings.");
 }
 
-/// Download and unpack the prebuilt Slang release into `target/slang-bin`,
-/// returning its `lib` directory. Cached across builds.
+/// Download and unpack the prebuilt Slang release into
+/// `target/slang-bin/v<SLANG_VERSION>`, returning its `lib` directory.
+/// Cached across builds. The cache directory is keyed on `SLANG_VERSION` so
+/// a version bump never reuses stale binaries.
 fn ensure_prebuilt(workspace_dir: &Path) -> PathBuf {
-	let cache_dir = workspace_dir.join("target/slang-bin");
+	let cache_dir = workspace_dir
+		.join("target/slang-bin")
+		.join(format!("v{SLANG_VERSION}"));
 	let lib_dir = cache_dir.join("lib");
 
 	if lib_dir.join(import_lib_name()).exists() {
@@ -147,16 +154,32 @@ fn ensure_prebuilt(workspace_dir: &Path) -> PathBuf {
 	let url = format!(
 		"https://github.com/shader-slang/slang/releases/download/v{SLANG_VERSION}/slang-{SLANG_VERSION}-{os}-{arch}.{ext}"
 	);
-	let archive_path = cache_dir.join(format!("slang.{ext}"));
+	let archive_name = format!("slang-{SLANG_VERSION}-{os}-{arch}.{ext}");
+	let archive_path = cache_dir.join(&archive_name);
 
 	std::fs::create_dir_all(&cache_dir).expect("Couldn't create slang-bin cache directory.");
 
+	// Download to a temporary file and rename into place only after the
+	// download succeeded, so an interrupted download cannot poison the cache.
 	if !archive_path.exists() {
+		let tmp_archive_path = cache_dir.join(format!("{archive_name}.tmp"));
 		run(Command::new("curl")
 			.args(["-sL", "-f", "-o"])
-			.arg(&archive_path)
+			.arg(&tmp_archive_path)
 			.arg(&url));
+		std::fs::rename(&tmp_archive_path, &archive_path)
+			.expect("Couldn't move the downloaded Slang archive into the cache.");
 	}
+
+	// Extract into a staging directory and move the contents into the cache
+	// only after extraction succeeded and the expected import library is
+	// present, so a partial extraction cannot poison the cache either.
+	let staging_dir = cache_dir.join(".staging");
+	if staging_dir.exists() {
+		std::fs::remove_dir_all(&staging_dir)
+			.expect("Couldn't clean up slang-bin staging directory.");
+	}
+	std::fs::create_dir_all(&staging_dir).expect("Couldn't create slang-bin staging directory.");
 
 	// bsdtar (Windows) and GNU/BSD tar (Linux/macOS) all auto-detect the
 	// zip/gzip format, so a single extraction path covers every platform.
@@ -164,13 +187,28 @@ fn ensure_prebuilt(workspace_dir: &Path) -> PathBuf {
 		.arg("-xf")
 		.arg(&archive_path)
 		.arg("-C")
-		.arg(&cache_dir));
+		.arg(&staging_dir));
 
 	assert!(
-		lib_dir.join(import_lib_name()).exists(),
+		staging_dir.join("lib").join(import_lib_name()).exists(),
 		"Prebuilt Slang archive did not contain expected lib/{}",
 		import_lib_name()
 	);
+
+	for entry in std::fs::read_dir(&staging_dir)
+		.expect("Couldn't read slang-bin staging directory.")
+		.flatten()
+	{
+		let dest = cache_dir.join(entry.file_name());
+		if dest.is_dir() {
+			std::fs::remove_dir_all(&dest).expect("Couldn't replace stale slang-bin cache entry.");
+		} else if dest.exists() {
+			std::fs::remove_file(&dest).expect("Couldn't replace stale slang-bin cache entry.");
+		}
+		std::fs::rename(entry.path(), &dest)
+			.expect("Couldn't move extracted Slang files into the cache.");
+	}
+	std::fs::remove_dir_all(&staging_dir).ok();
 
 	lib_dir
 }

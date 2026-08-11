@@ -548,7 +548,43 @@ const _: () = assert!(
 mod tests {
     use super::*;
 
-    /// Strips C/C++ comments so the brace matching and method counting below
+    /// Every COM interface with a handwritten vtable above, paired with the
+    /// number of methods declared directly on it in slang.h (excluding
+    /// inherited base-interface methods). Shared by the method-count test and
+    /// the signature snapshot test.
+    const INTERFACES: &[(&str, usize)] = &[
+        ("ISlangUnknown", ISLANG_UNKNOWN_METHODS),
+        ("ISlangCastable", ISLANG_CASTABLE_METHODS),
+        ("ISlangBlob", ISLANG_BLOB_METHODS),
+        ("ISlangFileSystem", ISLANG_FILE_SYSTEM_METHODS),
+        ("ISlangFileSystemExt", ISLANG_FILE_SYSTEM_EXT_METHODS),
+        ("ISlangMutableFileSystem", ISLANG_MUTABLE_FILE_SYSTEM_METHODS),
+        ("ISlangSharedLibrary", ISLANG_SHARED_LIBRARY_METHODS),
+        ("ISlangSharedLibraryLoader", ISLANG_SHARED_LIBRARY_LOADER_METHODS),
+        ("IGlobalSession", IGLOBAL_SESSION_METHODS),
+        ("ISession", ISESSION_METHODS),
+        ("IMetadata", IMETADATA_METHODS),
+        ("IComponentType", ICOMPONENT_TYPE_METHODS),
+        ("IEntryPoint", IENTRY_POINT_METHODS),
+        ("ITypeConformance", ITYPE_CONFORMANCE_METHODS),
+        ("IModule", IMODULE_METHODS),
+        ("ICompileResult", ICOMPILE_RESULT_METHODS),
+        ("IComponentType2", ICOMPONENT_TYPE2_METHODS),
+        ("IBindlessResourceMetadata", IBINDLESS_RESOURCE_METADATA_METHODS),
+        ("ICoverageTracingMetadata", ICOVERAGE_TRACING_METADATA_METHODS),
+        ("ISyntheticResourceMetadata", ISYNTHETIC_RESOURCE_METADATA_METHODS),
+        ("ICooperativeTypesMetadata", ICOOPERATIVE_TYPES_METADATA_METHODS),
+        (
+            "IModulePrecompileService_Experimental",
+            IMODULE_PRECOMPILE_SERVICE_EXPERIMENTAL_METHODS,
+        ),
+        ("IByteCodeRunner", IBYTE_CODE_RUNNER_METHODS),
+        ("ISlangClonable", ISLANG_CLONABLE_METHODS),
+        ("ISlangWriter", ISLANG_WRITER_METHODS),
+        ("ISlangProfiler", ISLANG_PROFILER_METHODS),
+    ];
+
+    /// Strips C/C++ comments so the brace matching and method extraction below
     /// are not confused by comment contents.
     fn strip_comments(source: &str) -> String {
         let bytes = source.as_bytes();
@@ -574,10 +610,8 @@ mod tests {
     }
 
     /// Finds the body of the `struct`/`class` named `name` (skipping forward
-    /// declarations) and counts its pure-virtual (`= 0;`) methods. This
-    /// catches methods declared without the `SLANG_MCALL` macro, e.g.
-    /// `IMetadata::isParameterLocationUsed` in slang.h.
-    fn count_pure_virtual_methods(source: &str, name: &str) -> Option<usize> {
+    /// declarations) and returns the text between its braces.
+    fn find_interface_body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
         let bytes = source.as_bytes();
 
         // Collect every `struct NAME` / `class NAME` occurrence where the name
@@ -622,10 +656,18 @@ mod tests {
             body_end += 1;
         }
 
+        Some(&source[body_start + 1..body_end])
+    }
+
+    /// Counts the pure-virtual (`= 0;`) methods in an interface body. This
+    /// catches methods declared without the `SLANG_MCALL` macro, e.g.
+    /// `IMetadata::isParameterLocationUsed` in slang.h.
+    fn count_pure_virtual_methods(source: &str, name: &str) -> Option<usize> {
+        let body = find_interface_body(source, name)?.as_bytes();
+
         // Count `= 0;` pure-virtual markers within the body. The `=` must not
         // be part of another operator (`!=`, `<=`, ...); default arguments
         // such as `= 0)` do not end in `;` and are ignored.
-        let body = &bytes[body_start..body_end];
         let mut count = 0;
         for (i, b) in body.iter().enumerate() {
             if *b != b'=' {
@@ -652,6 +694,125 @@ mod tests {
         Some(count)
     }
 
+    /// Removes preprocessor lines; they cannot appear inside the pure-virtual
+    /// declarations extracted below and would otherwise pollute them.
+    fn strip_preprocessor_lines(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Finds the `virtual` keyword at the start of a method declaration in
+    /// `text`, skipping any leading macro invocations (e.g. the
+    /// `SLANG_COM_INTERFACE(...)` UUID macro, which has no terminating `;`
+    /// and ends up glued to the first declaration of an interface body).
+    fn virtual_keyword_pos(text: &str) -> Option<usize> {
+        text.match_indices("virtual")
+            .map(|(pos, _)| pos)
+            .find(|&pos| {
+                let prev_ok = text[..pos]
+                    .chars()
+                    .last()
+                    .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+                let next_ok = text[pos + "virtual".len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_whitespace());
+                prev_ok && next_ok
+            })
+    }
+
+    /// Strips a trailing pure-virtual `= 0` marker, returning the declaration
+    /// without it, or `None` if the declaration is not pure virtual. The `=`
+    /// must not be part of another operator (`!=`, `<=`, ...).
+    fn strip_pure_virtual_marker(declaration: &str) -> Option<&str> {
+        let rest = declaration.trim_end().strip_suffix('0')?.trim_end();
+        let rest = rest.strip_suffix('=')?;
+        let prev = rest.chars().last()?;
+        if "!<>=+-*/&|^%".contains(prev) {
+            return None;
+        }
+        Some(rest.trim_end())
+    }
+
+    /// Extracts the normalized signatures of all pure-virtual methods declared
+    /// in an interface body, in declaration order. Whitespace is collapsed to
+    /// single spaces so cosmetic upstream reformatting does not register as a
+    /// signature change; parameter names and default arguments are kept,
+    /// since renaming them changes nothing about the vtable but flagging the
+    /// change still forces a human look at the diff.
+    fn extract_pure_virtual_signatures(body: &str) -> Vec<String> {
+        let body = strip_preprocessor_lines(body);
+        let bytes = body.as_bytes();
+        let mut signatures = Vec::new();
+        let mut chunk = String::new();
+        let mut paren_depth = 0usize;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => {
+                    paren_depth += 1;
+                    chunk.push('(');
+                    i += 1;
+                }
+                b')' => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                    chunk.push(')');
+                    i += 1;
+                }
+                // A `{` outside parentheses starts a method body or a nested
+                // type: skip to the matching `}` and drop the text accumulated
+                // so far (braces inside parentheses, as in the
+                // `SLANG_COM_INTERFACE({...})` UUID list, are kept as text).
+                b'{' if paren_depth == 0 => {
+                    let mut depth = 0usize;
+                    while i < bytes.len() {
+                        match bytes[i] {
+                            b'{' => depth += 1,
+                            b'}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                    chunk.clear();
+                }
+                b';' if paren_depth == 0 => {
+                    let normalized = chunk.split_whitespace().collect::<Vec<_>>().join(" ");
+                    chunk.clear();
+                    i += 1;
+                    let Some(start) = virtual_keyword_pos(&normalized) else {
+                        continue;
+                    };
+                    if let Some(signature) = strip_pure_virtual_marker(&normalized[start..]) {
+                        signatures.push(signature.to_string());
+                    }
+                }
+                b => {
+                    chunk.push(b as char);
+                    i += 1;
+                }
+            }
+        }
+        signatures
+    }
+
+    /// Best-effort method name of a normalized signature, for readable diffs.
+    fn method_name(signature: &str) -> &str {
+        let before_paren = signature.split('(').next().unwrap_or(signature);
+        before_paren
+            .split_whitespace()
+            .last()
+            .unwrap_or(before_paren)
+    }
+
     /// Cross-checks the handwritten vtable method counts against the slang.h
     /// the bindings were generated from (path exported by build.rs).
     #[test]
@@ -661,48 +822,162 @@ mod tests {
             .expect("failed to read slang.h");
         let source = strip_comments(&source);
 
-        for (interface, expected) in [
-            ("ISlangUnknown", ISLANG_UNKNOWN_METHODS),
-            ("ISlangCastable", ISLANG_CASTABLE_METHODS),
-            ("ISlangBlob", ISLANG_BLOB_METHODS),
-            ("ISlangFileSystem", ISLANG_FILE_SYSTEM_METHODS),
-            ("ISlangFileSystemExt", ISLANG_FILE_SYSTEM_EXT_METHODS),
-            (
-                "ISlangMutableFileSystem",
-                ISLANG_MUTABLE_FILE_SYSTEM_METHODS,
-            ),
-            ("ISlangSharedLibrary", ISLANG_SHARED_LIBRARY_METHODS),
-            (
-                "ISlangSharedLibraryLoader",
-                ISLANG_SHARED_LIBRARY_LOADER_METHODS,
-            ),
-            ("IGlobalSession", IGLOBAL_SESSION_METHODS),
-            ("ISession", ISESSION_METHODS),
-            ("IMetadata", IMETADATA_METHODS),
-            ("IComponentType", ICOMPONENT_TYPE_METHODS),
-            ("IEntryPoint", IENTRY_POINT_METHODS),
-            ("ITypeConformance", ITYPE_CONFORMANCE_METHODS),
-            ("IModule", IMODULE_METHODS),
-            ("ICompileResult", ICOMPILE_RESULT_METHODS),
-            ("IComponentType2", ICOMPONENT_TYPE2_METHODS),
-            ("IBindlessResourceMetadata", IBINDLESS_RESOURCE_METADATA_METHODS),
-            ("ICoverageTracingMetadata", ICOVERAGE_TRACING_METADATA_METHODS),
-            ("ISyntheticResourceMetadata", ISYNTHETIC_RESOURCE_METADATA_METHODS),
-            ("ICooperativeTypesMetadata", ICOOPERATIVE_TYPES_METADATA_METHODS),
-            (
-                "IModulePrecompileService_Experimental",
-                IMODULE_PRECOMPILE_SERVICE_EXPERIMENTAL_METHODS,
-            ),
-            ("IByteCodeRunner", IBYTE_CODE_RUNNER_METHODS),
-            ("ISlangClonable", ISLANG_CLONABLE_METHODS),
-            ("ISlangWriter", ISLANG_WRITER_METHODS),
-            ("ISlangProfiler", ISLANG_PROFILER_METHODS),
-        ] {
+        for &(interface, expected) in INTERFACES {
             assert_eq!(
                 count_pure_virtual_methods(&source, interface),
                 Some(expected),
                 "{interface}: slang.h method count does not match the handwritten vtable",
             );
         }
+    }
+
+    /// Reads the canonical Slang version from build.rs. `SLANG_VERSION` there
+    /// is the single source of truth for the whole workspace.
+    fn canonical_slang_version() -> String {
+        let build_rs = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/build.rs"));
+        let marker = "const SLANG_VERSION: &str = \"";
+        let start = build_rs
+            .find(marker)
+            .expect("SLANG_VERSION const not found in build.rs")
+            + marker.len();
+        let end = build_rs[start..]
+            .find('"')
+            .expect("malformed SLANG_VERSION const in build.rs")
+            + start;
+        build_rs[start..end].to_string()
+    }
+
+    /// Renders the checked-in snapshot format: one `[InterfaceName]` section
+    /// per interface, one normalized pure-virtual signature per line.
+    fn render_snapshot(source: &str) -> String {
+        let mut out = String::from(
+            "# slang.h COM interface vtable signature snapshot.\n\
+             # Regenerate after an intentional Slang upgrade with:\n\
+             #   SLANG_UPDATE_VTABLE_SNAPSHOT=1 cargo test -p shader-slang-rs-sys\n",
+        );
+        out.push_str(&format!("# Slang version: {}\n", canonical_slang_version()));
+        for &(interface, _) in INTERFACES {
+            let body = find_interface_body(source, interface)
+                .unwrap_or_else(|| panic!("{interface}: not found in slang.h"));
+            out.push_str(&format!("[{interface}]\n"));
+            for signature in extract_pure_virtual_signatures(body) {
+                out.push_str(&signature);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Parses the snapshot format back into (interface, signatures) sections.
+    fn parse_snapshot(text: &str) -> Vec<(String, Vec<String>)> {
+        let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim_end();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') {
+                sections.push((line[1..line.len() - 1].to_string(), Vec::new()));
+            } else if let Some((_, signatures)) = sections.last_mut() {
+                signatures.push(line.to_string());
+            }
+        }
+        sections
+    }
+
+    /// Cross-checks the full pure-virtual method signatures in slang.h against
+    /// the checked-in snapshot. The method-count test alone cannot catch a
+    /// changed signature with an unchanged count, which would silently
+    /// produce a wrong vtable.
+    #[test]
+    fn vtable_signatures_match_snapshot() {
+        let snapshot_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vtable_signatures.snap");
+        let include_dir = env!("SHADER_SLANG_RS_SYS_SLANG_INCLUDE_DIR");
+        let source = std::fs::read_to_string(format!("{include_dir}/slang.h"))
+            .expect("failed to read slang.h");
+        let source = strip_comments(&source);
+
+        if std::env::var_os("SLANG_UPDATE_VTABLE_SNAPSHOT").is_some() {
+            std::fs::write(snapshot_path, render_snapshot(&source))
+                .expect("failed to write vtable signature snapshot");
+            return;
+        }
+
+        let expected = parse_snapshot(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vtable_signatures.snap"
+        )));
+        let actual = parse_snapshot(&render_snapshot(&source));
+
+        let mut problems: Vec<String> = Vec::new();
+        for (interface, expected_sigs) in &expected {
+            let Some((_, actual_sigs)) = actual.iter().find(|(name, _)| name == interface) else {
+                problems.push(format!("{interface}: in snapshot but not found in slang.h"));
+                continue;
+            };
+            for i in 0..expected_sigs.len().max(actual_sigs.len()) {
+                match (expected_sigs.get(i), actual_sigs.get(i)) {
+                    (Some(e), Some(a)) if e == a => {}
+                    (Some(e), Some(a)) => problems.push(format!(
+                        "{interface} method #{} ({}):\n  expected: {e}\n  actual:   {a}",
+                        i + 1,
+                        method_name(a)
+                    )),
+                    (Some(e), None) => problems.push(format!(
+                        "{interface} method #{} ({}): missing from slang.h\n  expected: {e}",
+                        i + 1,
+                        method_name(e)
+                    )),
+                    (None, Some(a)) => problems.push(format!(
+                        "{interface} method #{} ({}): not in snapshot\n  actual:   {a}",
+                        i + 1,
+                        method_name(a)
+                    )),
+                    (None, None) => unreachable!(),
+                }
+            }
+        }
+        for (interface, _) in &actual {
+            if !expected.iter().any(|(name, _)| name == interface) {
+                problems.push(format!("{interface}: found in slang.h but missing from snapshot"));
+            }
+        }
+
+        assert!(
+            problems.is_empty(),
+            "slang.h COM interface signatures drifted from tests/vtable_signatures.snap:\n\n{}\n\n\
+            If this change is intentional (e.g. a Slang upgrade), update the handwritten vtables\n\
+            in src/lib.rs to match the new slang.h first, then regenerate the snapshot with:\n  \
+            SLANG_UPDATE_VTABLE_SNAPSHOT=1 cargo test -p shader-slang-rs-sys\n\
+            and review the resulting diff before committing it.",
+            problems.join("\n")
+        );
+    }
+
+    /// Guards the single source of truth for the Slang version:
+    /// `SLANG_VERSION` in build.rs. Every other machine-checked mention must
+    /// agree with it (prose mentions in README.md / AGENTS.md / doc comments
+    /// are covered by the upgrade checklist in AGENTS.md instead).
+    #[test]
+    fn slang_version_references_match_canonical() {
+        let version = canonical_slang_version();
+
+        let lib_rs = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+        let expected_comment = format!("// Based on Slang version {version}");
+        assert!(
+            lib_rs.lines().any(|line| line.trim() == expected_comment),
+            "src/lib.rs must carry the canonical SLANG_VERSION from build.rs in a\n\
+            `{expected_comment}` comment"
+        );
+
+        let snapshot =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vtable_signatures.snap"));
+        let expected_header = format!("# Slang version: {version}");
+        assert!(
+            snapshot.lines().any(|line| line == expected_header),
+            "tests/vtable_signatures.snap must carry the canonical SLANG_VERSION in a\n\
+            `{expected_header}` header; regenerate it with\n\
+            SLANG_UPDATE_VTABLE_SNAPSHOT=1 cargo test -p shader-slang-rs-sys"
+        );
     }
 }
