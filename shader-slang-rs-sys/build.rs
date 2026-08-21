@@ -334,8 +334,16 @@ fn import_lib_name() -> &'static str {
 /// as symlinks to avoid duplicating the (large) library contents.
 fn copy_runtime_libs_to_profile_dir(lib_dir: &Path) {
 	let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-	// OUT_DIR is <profile>/build/<pkg>-<hash>/out.
-	let Some(profile_dir) = out_dir.ancestors().nth(3).map(|p| p.to_path_buf()) else {
+	// OUT_DIR sits at <profile>/build/<pkg>-<hash>/out in the legacy target
+	// layout and <profile>/build/<name>/<hash>/out in the current one. Walk
+	// up to the `build` directory and take its parent — the profile
+	// directory — so both layouts resolve to the same place.
+	let Some(profile_dir) = out_dir
+		.ancestors()
+		.find(|p| p.file_name().is_some_and(|n| n == "build"))
+		.and_then(|b| b.parent())
+		.map(Path::to_path_buf)
+	else {
 		return;
 	};
 
